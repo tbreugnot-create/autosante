@@ -1,0 +1,7 @@
+# Ne jamais versionner les secrets
+.streamlit/secrets.toml
+
+# Fichiers système
+.DS_Store
+__pycache__/
+*.pyc
