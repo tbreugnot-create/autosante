@@ -39,8 +39,8 @@ def _cfg(key: str, default: str) -> str:
     except Exception:
         return default
 
-ODOO_EMAIL = _cfg("ODOO_EMAIL", "tbreugnot@di-africa.com")
-ODOO_KEY   = _cfg("ODOO_KEY",   "5f4ce9ee26e2e3c37f31c21bc5d05843853586cf")
+ODOO_EMAIL = _cfg("ODOO_EMAIL", "")
+ODOO_KEY   = _cfg("ODOO_KEY",   "")
 
 # Google Sheet partagé pour Taux Clients + Prestataires
 # → Partager la feuille "Paramètres" en "Tout le monde peut consulter"
