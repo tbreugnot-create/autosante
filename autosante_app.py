@@ -152,20 +152,44 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
 
     def _f(v, default=0.0):
         """
-        Convertit une valeur de taux en float décimal (0.0–1.0).
+        Convertit une valeur de TAUX en float décimal (0.0–1.0).
         Gère : 0.8 · "80%" · "80" · "0,8" · cellule vide
+        Utilisé pour consultations et pharmacies uniquement.
         """
         s = str(v).replace(",", ".").strip()
         has_pct = s.endswith("%")
         s = s.rstrip("%").strip()
         try:
             result = float(s) if s else default
-            # Si la valeur est en pourcentage (ex: 80 ou 80%) → diviser par 100
             if has_pct or result > 1.0:
                 result /= 100.0
             return result
         except (ValueError, TypeError):
             return default
+
+    def _f_optique(v):
+        """
+        Parse la colonne Optique qui peut contenir :
+        - Un PLAFOND en FCFA (ex: 110000) → retourner {"type": "cap", "val": 110000}
+        - Un TAUX en % (ex: "50%", "100%") → retourner {"type": "rate", "val": 0.5}
+        - Vide → None
+        """
+        s = str(v).replace(",", ".").strip() if v else ""
+        if not s:
+            return None
+        has_pct = s.endswith("%")
+        s_num = s.rstrip("%").strip()
+        try:
+            num = float(s_num)
+            if has_pct:
+                return {"type": "rate", "val": num / 100.0}
+            elif num <= 1.0:
+                return {"type": "rate", "val": num}
+            else:
+                # Grande valeur sans % → plafond en FCFA (ex: 110000)
+                return {"type": "cap", "val": num}
+        except (ValueError, TypeError):
+            return None
 
     # Taux Clients
     rates = {}
@@ -180,8 +204,8 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
             "consult_emp": _f(row[3] if len(row) > 3 else 0),
             "pharma_soc":  _f(row[4] if len(row) > 4 else 0),
             "pharma_emp":  _f(row[5] if len(row) > 5 else 0),
-            "optique_soc": _f(row[6]) if len(row) > 6 and row[6].strip() else None,
-            "optique_emp": _f(row[7]) if len(row) > 7 and row[7].strip() else None,
+            "optique_soc": _f_optique(row[6] if len(row) > 6 else ""),
+            "optique_emp": _f_optique(row[7] if len(row) > 7 else ""),
         }
 
     # Prestataires
@@ -249,13 +273,22 @@ def process_data(lines, employees, params) -> list:
 
         # Calcul parts
         if prest_type == "Optique":
-            cap = rate["optique_soc"]
-            if cap:
-                part_soc = min(balance, cap)
-                part_emp = max(0.0, balance - cap)
-            else:
+            opt_soc = rate["optique_soc"]
+            opt_emp = rate["optique_emp"]
+            if opt_soc is None:
+                # Pas de règle optique → 50/50 par défaut
                 part_soc = balance * 0.5
                 part_emp = balance * 0.5
+            elif opt_soc.get("type") == "cap":
+                # Plafond FCFA : société paye jusqu'au plafond, employé paye le reste
+                part_soc = min(balance, opt_soc["val"])
+                part_emp = max(0.0, balance - opt_soc["val"])
+            else:
+                # Taux % : répartition par ratio
+                soc_rate = opt_soc["val"]
+                emp_rate = opt_emp["val"] if opt_emp else (1.0 - soc_rate)
+                part_soc = balance * soc_rate
+                part_emp = balance * emp_rate
         elif prest_type == "Consultation":
             part_soc = balance * rate["consult_soc"]
             part_emp = balance * rate["consult_emp"]
@@ -473,15 +506,19 @@ def build_individual_excel(emp_name: str, emp_rows: list, period_label: str) -> 
 # ── GÉNÉRATION RAPPORT CLIENT (REFACTURATION) ─────────────────────────────
 def _taux_label(row: dict) -> str:
     """Affiche le taux/plafond en texte lisible pour le rapport client."""
-    if row["prest_type"] == "Optique":
-        # Optique : plafond fixe côté société
-        return f"Plafond {row['part_soc']:,.0f} FCFA" if row["part_emp"] > 0 else "100 % soc"
-    # Pourcentage côté société
     total = row["montant_total"]
-    if total > 0:
-        pct = round(row["part_soc"] / total * 100)
-        return f"{pct} %"
-    return "—"
+    if total <= 0:
+        return "—"
+    if row["prest_type"] == "Optique":
+        if row["part_emp"] == 0:
+            return "100 % soc"
+        elif row["part_soc"] >= total:
+            return "100 % soc"
+        else:
+            pct = round(row["part_soc"] / total * 100)
+            return f"Plafond / {pct} % soc" if pct < 100 else "100 % soc"
+    pct = round(row["part_soc"] / total * 100)
+    return f"{pct} %"
 
 
 def build_client_excel(client_name: str, client_rows: list, period_label: str) -> bytes:
