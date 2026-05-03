@@ -1467,21 +1467,37 @@ def build_releve_employe_docx(emp_name: str, client: str,
 # ── GÉNÉRATION BON DE CONSOMMATION (DOCX) ─────────────────────────────────
 def fill_bon_template(template_bytes: bytes, emp_name: str,
                       emp_rows: list, period_label: str,
-                      dest_type: str) -> bytes:
+                      dest_type: str,
+                      dette_totale: float = 0.0,
+                      retenue_mois: float = 0.0) -> bytes:
     """
-    Remplace <<NOM>> et <<TABLEAU_CONSOMMATIONS>> dans le template .docx.
+    Remplace les placeholders dans le template .docx.
     dest_type = 'Employeur' ou 'Employé'
+
+    Placeholders supportés :
+      <<NOM>>                 → nom de l'employé(e)
+      <<PERIODE>>             → libellé période (ex: "Avril 2026")
+      <<TABLEAU_CONSOMMATIONS>> → tableau détaillé des lignes du mois
+      <<DETTE_TOTALE>>        → encours total dû (dette M-1 + conso M), en FCFA
+      <<RETENUE_MOIS>>        → retenue sur salaire calculée pour ce mois, en FCFA
     """
     doc = Document(io.BytesIO(template_bytes))
 
-    # Remplacement <<NOM>>
+    def _fmt_fcfa(v: float) -> str:
+        return f"{v:,.0f} FCFA".replace(",", " ")  # espace fine comme séparateur
+
+    # Remplacement des placeholders simples (NOM, PERIODE, DETTE, RETENUE)
     for para in doc.paragraphs:
-        if "<<NOM>>" in para.text:
-            for run in para.runs:
-                run.text = run.text.replace("<<NOM>>", emp_name)
-        if "<<PERIODE>>" in para.text:
-            for run in para.runs:
-                run.text = run.text.replace("<<PERIODE>>", period_label)
+        for placeholder, value in [
+            ("<<NOM>>",          emp_name),
+            ("<<PERIODE>>",      period_label),
+            ("<<DETTE_TOTALE>>", _fmt_fcfa(dette_totale) if dette_totale else "0 FCFA"),
+            ("<<RETENUE_MOIS>>", _fmt_fcfa(retenue_mois) if retenue_mois else "0 FCFA"),
+        ]:
+            if placeholder in para.text:
+                for run in para.runs:
+                    if placeholder in run.text:
+                        run.text = run.text.replace(placeholder, value)
 
     # Remplacement <<TABLEAU_CONSOMMATIONS>>
     for para in doc.paragraphs:
@@ -1817,6 +1833,14 @@ def main():
                 for r in rows:
                     by_emp[r["employee_name"]].append(r)
 
+                # Chargement des attachments Odoo (pour dette + retenue dans les bons)
+                _attachments_for_bons = {}
+                if tpl_emp or tpl_empeur:
+                    try:
+                        _attachments_for_bons = fetch_salary_attachments(uid, models)
+                    except Exception:
+                        _attachments_for_bons = {}
+
                 for emp_name, emp_rows in by_emp.items():
                     safe_name = re.sub(r'[\\/*?:"<>|]', "_", emp_name)
                     emp_client = emp_rows[0]["client"] if emp_rows else ""
@@ -1831,12 +1855,28 @@ def main():
                     )
                     zf.writestr(f"Relevés/{safe_name}.docx", releve)
 
+                    # Calcul dette totale + retenue pour les bons de consommation
+                    _part_emp_mois = sum(r["part_emp"] for r in emp_rows)
+                    _att = _attachments_for_bons.get(emp_name, {})
+                    _dette_precedente = _att.get("balance", 0.0)
+                    _total_du = _dette_precedente + _part_emp_mois
+                    # Règle retenue : utiliser celle du client si disponible
+                    _emp_client_rate = params.get("rates", {})
+                    _regle = "15%"
+                    for _k, _v in _emp_client_rate.items():
+                        if _k.lower() == emp_client.lower():
+                            _regle = _v.get("regle_retenue", "15%")
+                            break
+                    _retenue_mois = _calc_retenue(_total_du, _regle)
+
                     # Bons de consommation (si templates fournis)
                     if tpl_emp:
                         tpl_emp.seek(0)
                         bon_emp = fill_bon_template(
                             tpl_emp.read(), emp_name, emp_rows,
-                            period_label, "Employé"
+                            period_label, "Employé",
+                            dette_totale=_total_du,
+                            retenue_mois=_retenue_mois,
                         )
                         zf.writestr(f"Bons_Employe/{safe_name}_bon_employe.docx", bon_emp)
 
@@ -1844,7 +1884,9 @@ def main():
                         tpl_empeur.seek(0)
                         bon_empeur = fill_bon_template(
                             tpl_empeur.read(), emp_name, emp_rows,
-                            period_label, "Employeur"
+                            period_label, "Employeur",
+                            dette_totale=_total_du,
+                            retenue_mois=_retenue_mois,
                         )
                         zf.writestr(f"Bons_Employeur/{safe_name}_bon_employeur.docx",
                                     bon_empeur)
