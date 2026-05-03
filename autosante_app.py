@@ -2160,6 +2160,243 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
 > 💡 Ces champs seront visibles par les RH dans la fiche de chaque employé pour aider à expliquer les déductions sur fiche de paie.
             """)
 
+    # ── Phase 3 : Contrôle Clôture ────────────────────────────────────────
+    st.divider()
+    st.subheader("🔍 Phase 3 — Contrôle Clôture")
+    st.caption(
+        "Croise les consommations du mois avec les `hr.salary.attachment` Odoo "
+        "pour vérifier que les retenues configurées correspondent aux calculs "
+        "et que les soldes de dette sont cohérents."
+    )
+
+    if not st.session_state.get("rows"):
+        st.info("👆 Génère d'abord le rapport mensuel pour activer le contrôle de clôture.")
+    else:
+        _ctrl_period = st.session_state.get("period_label", "—")
+        st.markdown(f"**Période contrôlée :** {_ctrl_period}")
+
+        if st.button("🔍 Lancer le contrôle de clôture", key="btn_cloture",
+                     type="primary", use_container_width=True):
+            import pandas as pd
+
+            with st.spinner("Lecture des retenues actives dans Odoo…"):
+                _ctrl_atts = fetch_salary_attachments(uid, models)
+
+            # ── Agréger la part employé du mois par employé ───────────────
+            _ctrl_rows = st.session_state["rows"]
+            _ctrl_by_emp: dict = {}
+            for _r in _ctrl_rows:
+                _en = _r["employee_name"]
+                if _en not in _ctrl_by_emp:
+                    _ctrl_by_emp[_en] = {"client": _r["client"], "part_emp_mois": 0.0}
+                _ctrl_by_emp[_en]["part_emp_mois"] += _r["part_emp"]
+
+            # ── Construire le tableau de contrôle ─────────────────────────
+            _ctrl_data = []
+            for _emp, _info in sorted(_ctrl_by_emp.items()):
+                _client        = _info["client"]
+                _conso_mois    = _info["part_emp_mois"]
+                _att           = _ctrl_atts.get(_emp)
+
+                # Récupérer la règle de retenue du client
+                _regle = "15%"
+                for _ck, _cv in params.get("rates", {}).items():
+                    if _ck.lower() == _client.lower():
+                        _regle = _cv.get("regle_retenue", "15%")
+                        break
+
+                if _att is None:
+                    # Aucune retenue dans Odoo — nouvel employé
+                    _dette_odoo    = 0.0
+                    _retenue_odoo  = 0.0
+                    _total_du      = _conso_mois
+                    _retenue_calc  = _calc_retenue(_total_du, _regle)
+                    _ecart_ret     = None      # pas de comparaison possible
+                    _statut        = "🆕 Nouveau"
+                else:
+                    _dette_odoo    = float(_att["total_amount"])
+                    _retenue_odoo  = float(_att["monthly_amount"])
+                    _total_du      = _dette_odoo + _conso_mois
+                    _retenue_calc  = _calc_retenue(_total_du, _regle)
+                    _ecart_ret     = _retenue_odoo - _retenue_calc
+                    _ecart_pct     = abs(_ecart_ret) / _retenue_calc if _retenue_calc else 0
+                    if abs(_ecart_ret) <= 1:
+                        _statut = "🟢 OK"
+                    elif _ecart_pct < 0.10:
+                        _statut = "🟡 Écart mineur"
+                    else:
+                        _statut = "🔴 Écart significatif"
+
+                _ctrl_data.append({
+                    "Employé":            _emp,
+                    "Client":             _client,
+                    "Conso mois (FCFA)":  _conso_mois,
+                    "Dette Odoo (FCFA)":  _dette_odoo,
+                    "Total dû (FCFA)":    _total_du,
+                    "Retenue calculée":   _retenue_calc,
+                    "Retenue Odoo":       _retenue_odoo,
+                    "Écart (FCFA)":       _ecart_ret if _ecart_ret is not None else "—",
+                    "Statut":             _statut,
+                    "Règle":              _regle,
+                })
+
+            df_ctrl = pd.DataFrame(_ctrl_data)
+
+            # ── Résumé ─────────────────────────────────────────────────────
+            _n_ok        = (df_ctrl["Statut"] == "🟢 OK").sum()
+            _n_mineur    = (df_ctrl["Statut"] == "🟡 Écart mineur").sum()
+            _n_signif    = (df_ctrl["Statut"] == "🔴 Écart significatif").sum()
+            _n_nouveau   = (df_ctrl["Statut"] == "🆕 Nouveau").sum()
+
+            _c1, _c2, _c3, _c4 = st.columns(4)
+            _c1.metric("🟢 OK",                _n_ok)
+            _c2.metric("🟡 Écarts mineurs",     _n_mineur)
+            _c3.metric("🔴 Écarts significatifs", _n_signif)
+            _c4.metric("🆕 Nouveaux employés",  _n_nouveau)
+
+            if _n_signif > 0:
+                st.warning(
+                    f"⚠️ {_n_signif} employé(s) avec écart significatif entre la retenue "
+                    "configurée dans Odoo et le calcul théorique — vérifier et corriger."
+                )
+            elif _n_mineur > 0:
+                st.info(f"ℹ️ {_n_mineur} écart(s) mineur(s) — probablement des arrondis.")
+            else:
+                st.success("✅ Toutes les retenues actives correspondent aux calculs.")
+
+            # ── Tableau principal ──────────────────────────────────────────
+            st.dataframe(
+                df_ctrl[[
+                    "Statut", "Employé", "Client",
+                    "Conso mois (FCFA)", "Dette Odoo (FCFA)", "Total dû (FCFA)",
+                    "Retenue calculée", "Retenue Odoo", "Écart (FCFA)", "Règle",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # ── Détail des écarts significatifs ────────────────────────────
+            _df_signif = df_ctrl[df_ctrl["Statut"] == "🔴 Écart significatif"]
+            if not _df_signif.empty:
+                with st.expander(
+                    f"🔴 Détail des {len(_df_signif)} écarts significatifs", expanded=True
+                ):
+                    for _, _row in _df_signif.iterrows():
+                        st.markdown(
+                            f"**{_row['Employé']}** ({_row['Client']}) — "
+                            f"Retenue Odoo : **{_row['Retenue Odoo']:,.0f} FCFA** | "
+                            f"Calculée : **{_row['Retenue calculée']:,.0f} FCFA** | "
+                            f"Écart : **{float(_row['Écart (FCFA)']):+,.0f} FCFA** | "
+                            f"Règle : `{_row['Règle']}`"
+                        )
+                    st.caption(
+                        "→ Corriger le champ `monthly_amount` dans `hr.salary.attachment` "
+                        "Odoo ou ajuster la règle de retenue dans le Google Sheet (col Règle_Retenue)."
+                    )
+
+            # ── Nouveaux employés (pas encore dans Odoo) ───────────────────
+            _df_new = df_ctrl[df_ctrl["Statut"] == "🆕 Nouveau"]
+            if not _df_new.empty:
+                with st.expander(
+                    f"🆕 {len(_df_new)} employé(s) sans retenue dans Odoo", expanded=True
+                ):
+                    for _, _row in _df_new.iterrows():
+                        st.markdown(
+                            f"**{_row['Employé']}** ({_row['Client']}) — "
+                            f"Conso mois : **{_row['Conso mois (FCFA)']:,.0f} FCFA** | "
+                            f"Retenue à créer : **{_row['Retenue calculée']:,.0f} FCFA** | "
+                            f"Règle : `{_row['Règle']}`"
+                        )
+                    st.caption(
+                        "→ Ces employés n'ont pas encore de `hr.salary.attachment` actif. "
+                        "Utiliser la Phase 2 (Plan de retenues) pour générer le fichier d'import Odoo NEW."
+                    )
+
+            # ── Export Excel du contrôle ────────────────────────────────────
+            import io as _io
+            import openpyxl
+            from openpyxl.styles import PatternFill, Font, Alignment
+            _wb_ctrl = openpyxl.Workbook()
+            _ws_ctrl = _wb_ctrl.active
+            _ws_ctrl.title = "Contrôle Clôture"
+            _ws_ctrl["A1"] = f"Contrôle Clôture — {_ctrl_period}"
+            _ws_ctrl["A1"].font = Font(bold=True, size=13)
+            _ws_ctrl.merge_cells("A1:J1")
+
+            _ctrl_headers = [
+                "Statut", "Employé", "Client",
+                "Conso mois", "Dette Odoo", "Total dû",
+                "Retenue calculée", "Retenue Odoo", "Écart", "Règle",
+            ]
+            _ws_ctrl.append([])
+            _ws_ctrl.append(_ctrl_headers)
+            _hrow = _ws_ctrl.max_row
+            for _hcell in _ws_ctrl[_hrow]:
+                _hcell.font      = Font(bold=True)
+                _hcell.fill      = PatternFill("solid", fgColor="1F4E79")
+                _hcell.font      = Font(bold=True, color="FFFFFF")
+                _hcell.alignment = Alignment(horizontal="center")
+
+            _fill_ok     = PatternFill("solid", fgColor="C6EFCE")
+            _fill_warn   = PatternFill("solid", fgColor="FFEB9C")
+            _fill_err    = PatternFill("solid", fgColor="FFC7CE")
+            _fill_new    = PatternFill("solid", fgColor="DDEBF7")
+
+            for _, _row in df_ctrl.iterrows():
+                _ecart_val = _row["Écart (FCFA)"]
+                _ecart_out = float(_ecart_val) if _ecart_val != "—" else ""
+                _ws_ctrl.append([
+                    _row["Statut"],
+                    _row["Employé"],
+                    _row["Client"],
+                    _row["Conso mois (FCFA)"],
+                    _row["Dette Odoo (FCFA)"],
+                    _row["Total dû (FCFA)"],
+                    _row["Retenue calculée"],
+                    _row["Retenue Odoo"],
+                    _ecart_out,
+                    _row["Règle"],
+                ])
+                _dr = _ws_ctrl.max_row
+                _statut_val = _row["Statut"]
+                if "🟢" in _statut_val:
+                    _fill = _fill_ok
+                elif "🟡" in _statut_val:
+                    _fill = _fill_warn
+                elif "🔴" in _statut_val:
+                    _fill = _fill_err
+                else:
+                    _fill = _fill_new
+                for _dc in range(1, 11):
+                    _ws_ctrl.cell(_dr, _dc).fill = _fill
+
+            # Format colonnes monétaires
+            for _col_idx in [4, 5, 6, 7, 8, 9]:
+                for _dr in range(_hrow + 1, _ws_ctrl.max_row + 1):
+                    _c = _ws_ctrl.cell(_dr, _col_idx)
+                    if isinstance(_c.value, (int, float)):
+                        _c.number_format = '#,##0'
+
+            # Largeurs colonnes
+            for _col, _w in zip("ABCDEFGHIJ", [18, 28, 18, 16, 16, 16, 18, 16, 12, 10]):
+                _ws_ctrl.column_dimensions[_col].width = _w
+
+            _ctrl_buf = _io.BytesIO()
+            _wb_ctrl.save(_ctrl_buf)
+            _ctrl_buf.seek(0)
+
+            st.download_button(
+                label=f"📥 Exporter le contrôle de clôture — {_ctrl_period}.xlsx",
+                data=_ctrl_buf.getvalue(),
+                file_name=f"Controle_Cloture_{_ctrl_period.replace(' ', '_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            st.session_state["ctrl_cloture_done"] = True
+
+        elif st.session_state.get("ctrl_cloture_done"):
+            st.success("✅ Contrôle de clôture déjà effectué — relance disponible ci-dessus.")
 
 
 # ── PHASE 2 : RETENUES SUR SALAIRE ───────────────────────────────────────
