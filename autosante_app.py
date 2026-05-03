@@ -58,7 +58,7 @@ _CLIENT_RE = re.compile(
 # Détermine la règle de partage employeur/employé selon le code article Odoo.
 #
 #  "salarie"         → table "Taux Clients"         (taux contractuels par client)
-#  "ayants_droits"   → table "Taux Ayants Droits"   (taux spécifiques AD par client)
+#  "ayants_droits"   → colonnes M-R de "Taux Clients"  (taux spécifiques AD par client)
 #  "ayants_droits_na"→ 100 % employé                (non autorisé)
 #  "accident"        → 100 % employeur              (accident du travail)
 #  "insurance"       → 100 % employeur              (assurance / insurance)
@@ -336,11 +336,14 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
     #  0=CC  1=Client  2=Consult_Soc  3=Consult_Emp  4=Pharma_Soc  5=Pharma_Emp
     #  6=Optique_Soc  7=Optique_Emp  8=Modèle  9=Plafond_Contrat  10=Plafond_Employé
     #  11=Règle_Retenue  (optionnel : "15%"|"total"|"1/3"|"1/4"|"1/5"|"fixe:25000")
+    #  12=AD_Consult_Soc  13=AD_Consult_Emp  14=AD_Pharma_Soc  15=AD_Pharma_Emp
+    #  16=AD_Optique_Soc  17=AD_Optique_Emp  (taux spécifiques Ayants Droits — vide = même que Salarié)
     #
-    # Optique_Soc peut être :
+    # Optique_Soc / AD_Optique_Soc peuvent être :
     #   - Un FCFA (ex: 110000) → plafond annuel par employé (cumulatif YTD)
     #   - Un % (ex: "80%")     → taux par facture, reliquat à charge employé
     rates = {}
+    rates_ad = {}
     taux_rows = fetch_sheet_csv("Taux Clients")
     for row in taux_rows[1:]:   # skip header
         if len(row) < 2 or not row[1].strip():
@@ -362,36 +365,25 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
             "plafond_emp":    _f_plafond(row[10] if len(row) > 10 else ""), # Plafond par employé FCFA/an
             "regle_retenue":  raw_regle,                                     # règle retenue sur salaire
         }
-
-    # Taux Ayants Droits
-    # Même structure que "Taux Clients" — colonnes identiques.
-    # Si la feuille n'existe pas encore, on retourne un dict vide (pas de blocage).
-    rates_ad = {}
-    try:
-        taux_ad_rows = fetch_sheet_csv("Taux Ayants Droits")
-        for row in taux_ad_rows[1:]:
-            if len(row) < 2 or not row[1].strip():
-                continue
-            client_ad = row[1].strip()
-            raw_modele_ad = row[8].strip().lower() if len(row) > 8 and row[8].strip() else "open bar"
-            modele_ad = "provision" if "provision" in raw_modele_ad else "open bar"
-            raw_regle_ad = row[11].strip().lower() if len(row) > 11 and row[11].strip() else "15%"
-            rates_ad[client_ad] = {
-                "cc":             row[0].strip() if row[0] else "",
-                "consult_soc":    _f(row[2] if len(row) > 2 else 0),
-                "consult_emp":    _f(row[3] if len(row) > 3 else 0),
-                "pharma_soc":     _f(row[4] if len(row) > 4 else 0),
-                "pharma_emp":     _f(row[5] if len(row) > 5 else 0),
-                "optique_soc":    _f_optique(row[6] if len(row) > 6 else ""),
-                "optique_emp":    _f_optique(row[7] if len(row) > 7 else ""),
-                "modele":         modele_ad,
-                "plafond":        _f_plafond(row[9]  if len(row) > 9  else ""),
-                "plafond_emp":    _f_plafond(row[10] if len(row) > 10 else ""),
-                "regle_retenue":  raw_regle_ad,
+        # Taux Ayants Droits — colonnes M-R (indices 12-17)
+        # Si au moins une cellule est renseignée → entrée spécifique AD pour ce client.
+        # Cellule vide = on hérite du taux Salarié correspondant.
+        ad_vals = [row[i] if len(row) > i else "" for i in range(12, 18)]
+        if any(v.strip() for v in ad_vals):
+            rates_ad[client] = {
+                "cc":            row[0].strip() if row[0] else "",
+                "consult_soc":   _f(ad_vals[0]) if ad_vals[0].strip() else rates[client]["consult_soc"],
+                "consult_emp":   _f(ad_vals[1]) if ad_vals[1].strip() else rates[client]["consult_emp"],
+                "pharma_soc":    _f(ad_vals[2]) if ad_vals[2].strip() else rates[client]["pharma_soc"],
+                "pharma_emp":    _f(ad_vals[3]) if ad_vals[3].strip() else rates[client]["pharma_emp"],
+                "optique_soc":   _f_optique(ad_vals[4]) if ad_vals[4].strip() else rates[client]["optique_soc"],
+                "optique_emp":   _f_optique(ad_vals[5]) if ad_vals[5].strip() else rates[client]["optique_emp"],
+                # Modèle, plafonds et règle retenue identiques au contrat Salarié
+                "modele":        modele,
+                "plafond":       _f_plafond(row[9]  if len(row) > 9  else ""),
+                "plafond_emp":   _f_plafond(row[10] if len(row) > 10 else ""),
+                "regle_retenue": raw_regle,
             }
-    except Exception:
-        # Feuille absente ou erreur → pas de blocage, avertissement en UI
-        rates_ad = {}
 
     # Prestataires
     prest = {}
@@ -532,7 +524,7 @@ def process_data(lines, employees, params,
             rate     = _RATE_100_EMP
         else:
             # "salarie" → table Taux Clients
-            # "ayants_droits" → table Taux Ayants Droits (fallback → Taux Clients)
+            # "ayants_droits" → colonnes M-R de "Taux Clients" (fallback → colonnes A-L)
             rates_ad = params.get("rates_ad", {})
             if article_type == "ayants_droits" and rates_ad:
                 rate = _find_rate(client, rates_ad)
@@ -540,7 +532,7 @@ def process_data(lines, employees, params,
                     # Pas de ligne AD pour ce client → fallback table principale avec warning
                     rate = _find_rate(client, rates)
                     if rate is not None:
-                        warning = (f"Client '{client}' absent de 'Taux Ayants Droits' "
+                        warning = (f"Client '{client}' sans taux AD (colonnes M-R vides) "
                                    f"→ taux Salarié appliqué par défaut")
             else:
                 rate = _find_rate(client, rates)
