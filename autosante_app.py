@@ -243,6 +243,100 @@ def fetch_salary_attachments(_uid, _models):
     return result
 
 
+@st.cache_data(ttl=300, show_spinner="Récupération des retraits santé via fiches de paie…")
+def fetch_payslip_deductions(_uid, _models, year: int = None, month: int = None):
+    """
+    Contournement pour les instances Odoo où hr.salary.attachment n'expose
+    pas employee_id via XML-RPC.
+
+    Chemin : hr.payslip.input (amount, type "Retraits Santé")
+              → hr.payslip (employee_id [id, nom])
+
+    Retourne : {emp_name: {
+        "monthly_amount": float,   # montant retenu sur la paie de la période
+        "total_amount":   0.0,     # non disponible sans employee_id sur hr.salary.attachment
+        "paid_amount":    0.0,
+        "remaining":      0.0,
+        "date_start":     str,     # date_from de la fiche de paie
+        "state":          str,     # état de la fiche de paie
+        "employee_name":  str,
+    }}
+    """
+    import calendar as _cal
+
+    # ── 1. Récupérer les fiches de paie de la période ──────────────────────
+    ps_domain: list = [["company_id", "=", COMPANY_ID]]
+    if year and month:
+        _d_from = f"{year}-{month:02d}-01"
+        _d_to   = f"{year}-{month:02d}-{_cal.monthrange(year, month)[1]:02d}"
+        ps_domain += [["date_from", ">=", _d_from], ["date_from", "<=", _d_to]]
+
+    try:
+        payslips = odoo_read(_models, _uid, "hr.payslip",
+                             ps_domain,
+                             ["id", "employee_id", "date_from", "state"],
+                             limit=5000)
+    except Exception as _e:
+        st.warning(f"⚠️ fetch_payslip_deductions — impossible de lire hr.payslip : {_e}")
+        return {}
+
+    if not payslips:
+        return {}
+
+    ps_map  = {p["id"]: p for p in payslips}
+    ps_ids  = list(ps_map.keys())
+
+    # ── 2. Récupérer les lignes de saisie de type "Retraits Santé" ─────────
+    try:
+        inputs = odoo_read(_models, _uid, "hr.payslip.input",
+                           [["payslip_id", "in", ps_ids]],
+                           ["id", "amount", "payslip_id", "input_type_id"],
+                           limit=5000)
+    except Exception as _e:
+        st.warning(f"⚠️ fetch_payslip_deductions — impossible de lire hr.payslip.input : {_e}")
+        return {}
+
+    # ── 3. Construire {emp_name → données} ────────────────────────────────
+    result: dict = {}
+    for inp in inputs:
+        type_info = inp.get("input_type_id")
+        type_name = (type_info[1]
+                     if isinstance(type_info, (list, tuple)) and len(type_info) >= 2
+                     else "")
+        if not ("sant" in type_name.lower() or "retrait" in type_name.lower()):
+            continue
+
+        ps_ref  = inp.get("payslip_id")
+        ps_id   = ps_ref[0] if isinstance(ps_ref, (list, tuple)) else ps_ref
+        if not ps_id or ps_id not in ps_map:
+            continue
+
+        ps  = ps_map[ps_id]
+        emp = ps.get("employee_id")
+        emp_name = (emp[1]
+                    if isinstance(emp, (list, tuple)) and len(emp) >= 2
+                    else "")
+        if not emp_name:
+            continue
+
+        amt = float(inp.get("amount") or 0)
+        # En cas de plusieurs lignes pour le même employé, on cumule
+        if emp_name in result:
+            result[emp_name]["monthly_amount"] += amt
+        else:
+            result[emp_name] = {
+                "monthly_amount": amt,
+                "total_amount":   0.0,   # non disponible via ce chemin
+                "paid_amount":    0.0,
+                "remaining":      0.0,
+                "date_start":     ps.get("date_from", ""),
+                "state":          ps.get("state", ""),
+                "employee_name":  emp_name,
+            }
+
+    return result
+
+
 @st.cache_data(ttl=3600, show_spinner="Chargement des employés (actifs + archivés)…")
 def fetch_employees(_uid, _models):
     """Employés DI-Africa Congo — actifs ET archivés pour garantir
@@ -2134,9 +2228,10 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
                 )
             with col_dl2:
                 if st.button("🔄 Forcer rechargement Odoo", use_container_width=True,
-                             help="Vide le cache (5 min) et relit hr.salary.attachment depuis Odoo — "
+                             help="Vide le cache (5 min) et relit les retenues depuis Odoo — "
                                   "utile après un import pour confirmer la prise en compte."):
                     fetch_salary_attachments.clear()
+                    fetch_payslip_deductions.clear()
                     st.rerun()
 
             st.caption(
@@ -2209,8 +2304,16 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
                      type="primary", use_container_width=True):
             import pandas as pd
 
-            with st.spinner("Lecture des retenues actives dans Odoo…"):
-                _ctrl_atts = fetch_salary_attachments(uid, models)
+            _ctrl_year  = st.session_state.get("year")
+            _ctrl_month = st.session_state.get("month")
+
+            with st.spinner("Lecture des retraits santé (hr.payslip) dans Odoo…"):
+                # Passage par hr.payslip.input → hr.payslip.employee_id car
+                # hr.salary.attachment n'expose pas employee_id via XML-RPC
+                # dans cette instance Odoo.
+                _ctrl_atts = fetch_payslip_deductions(uid, models,
+                                                       year=_ctrl_year,
+                                                       month=_ctrl_month)
 
             # ── Agréger par employé ────────────────────────────────────────
             _ctrl_rows = st.session_state["rows"]
@@ -2282,7 +2385,11 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
             _n_surcharge  = (df_ctrl["Statut"] == "🔴 Trop prélevé").sum()
             _taux_reel    = _tot_retrait / _tot_emp if _tot_emp else 0.0
 
-            st.markdown(f"**{_n_atts} retenues actives lues dans Odoo**")
+            _ctrl_period_lbl = st.session_state.get("period_label", "—")
+            st.markdown(
+                f"**{_n_atts} retraits santé trouvés sur les fiches de paie "
+                f"{_ctrl_period_lbl}** *(source : hr.payslip.input)*"
+            )
 
             _g1, _g2, _g3, _g4 = st.columns(4)
             _g1.metric("Conso part employé",   f"{_tot_emp:,.0f} F")
