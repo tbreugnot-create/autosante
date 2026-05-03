@@ -189,9 +189,19 @@ def fetch_salary_attachments(_uid, _models):
     try:
         records = odoo_read(_models, _uid, "hr.salary.attachment",
                             domain, fields, limit=5000)
-    except Exception as e:
-        st.warning(f"⚠️ Impossible de lire hr.salary.attachment : {e}")
-        return {}
+    except Exception as first_err:
+        if "Invalid field" in str(first_err) and "employee_id" in str(first_err):
+            # Certaines instances Odoo n'exposent pas employee_id directement —
+            # on récupère tous les champs disponibles et on trouve l'employé dynamiquement.
+            try:
+                records = odoo_read(_models, _uid, "hr.salary.attachment",
+                                    domain, [], limit=5000)
+            except Exception as e2:
+                st.warning(f"⚠️ Impossible de lire hr.salary.attachment : {e2}")
+                return {}
+        else:
+            st.warning(f"⚠️ Impossible de lire hr.salary.attachment : {first_err}")
+            return {}
 
     result = {}
     for r in records:
@@ -200,9 +210,21 @@ def fetch_salary_attachments(_uid, _models):
         # Garder uniquement les Retraits Santé
         if not ("sant" in type_name.lower() or "retrait" in type_name.lower()):
             continue
-        emp      = r.get("employee_id")
-        emp_id   = emp[0] if emp else None
-        emp_name = emp[1] if emp else ""
+        # Chercher le champ employé (Many2one → [id, nom]) — supporte plusieurs noms de champ
+        emp_id, emp_name = None, ""
+        for _fk in ("employee_id", "emp_id", "hr_employee_id"):
+            _fv = r.get(_fk)
+            if isinstance(_fv, (list, tuple)) and len(_fv) == 2:
+                emp_id, emp_name = _fv[0], _fv[1]
+                break
+        if not emp_name:
+            # Fallback : chercher dynamiquement tout champ Many2one dont le nom contient "employee"
+            for _fk, _fv in r.items():
+                if "employee" in _fk.lower() and isinstance(_fv, (list, tuple)) and len(_fv) == 2:
+                    emp_id, emp_name = _fv[0], _fv[1]
+                    break
+        if not emp_name:
+            emp_name = f"Attachement-{r.get('id', '?')}"
         total    = float(r.get("total_amount", 0) or 0)
         paid     = float(r.get("paid_amount",  0) or 0)
         result[emp_name] = {
@@ -2200,7 +2222,8 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
 
                 # Récupérer la règle de retenue du client
                 _regle = "15%"
-                for _ck, _cv in params.get("rates", {}).items():
+                _p_rates = st.session_state.get("params", {}).get("rates", {})
+                for _ck, _cv in _p_rates.items():
                     if _ck.lower() == _client.lower():
                         _regle = _cv.get("regle_retenue", "15%")
                         break
