@@ -1,5 +1,5 @@
 """
-AutoSanté v2.1 — Odoo API direct · Paramètres via Google Sheets
+AutoSanté v2.2 — Odoo API direct · Paramètres via Google Sheets · YTD + Provision Santé
 Société : DI-Africa (Congo) SA uniquement (company_id = 3)
 
 Installation :
@@ -81,6 +81,32 @@ def fetch_invoice_lines(_uid, _models, date_from: str, date_to: str):
     # Filtre identique au filtre Odoo manuel d'Aurice :
     # "Invoice lines contains Medical" → product_id.name ilike "Medical"
     # + Optique pour les soins optiques
+    domain = [
+        ["company_id",            "=",  COMPANY_ID],
+        ["move_id.state",         "=",  "posted"],
+        ["date",                  ">=", date_from],
+        ["date",                  "<=", date_to],
+        ["x_studio_employee_inv", "!=", False],
+        "|",
+        ["product_id.name", "ilike", "Medical"],
+        ["product_id.name", "ilike", "Optique"],
+    ]
+    fields = [
+        "move_id", "product_id", "balance",
+        "partner_id", "date", "x_studio_employee_inv",
+    ]
+    return odoo_read(_models, _uid, "account.move.line", domain, fields)
+
+
+@st.cache_data(ttl=300, show_spinner="Récupération des données YTD (Jan → mois sélectionné)…")
+def fetch_invoice_lines_ytd(_uid, _models, year: int, month: int):
+    """
+    Lignes de facture santé DI-Africa Congo du 1er janvier au dernier jour
+    du mois sélectionné — utilisé pour les cumuls YTD et le suivi provision.
+    """
+    date_from = f"{year}-01-01"
+    last_day  = calendar.monthrange(year, month)[1]
+    date_to   = f"{year}-{month:02d}-{last_day:02d}"
     domain = [
         ["company_id",            "=",  COMPANY_ID],
         ["move_id.state",         "=",  "posted"],
@@ -191,13 +217,31 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
         except (ValueError, TypeError):
             return None
 
+    def _f_plafond(v):
+        """
+        Parse un plafond annuel de provision santé en FCFA.
+        Accepte : 5000000 · "5 000 000" · "5,000,000" · vide → None
+        """
+        s = str(v).replace(",", "").replace(" ", "").replace(" ", "").strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            return None
+
     # Taux Clients
+    # Colonnes attendues dans "Taux Clients" :
+    #  0=CC  1=Client  2=Consult_Soc  3=Consult_Emp  4=Pharma_Soc  5=Pharma_Emp
+    #  6=Optique_Soc  7=Optique_Emp  8=Modèle  9=Plafond_FCFA
     rates = {}
     taux_rows = fetch_sheet_csv("Taux Clients")
     for row in taux_rows[1:]:   # skip header
         if len(row) < 2 or not row[1].strip():
             continue
         client = row[1].strip()
+        raw_modele = row[8].strip().lower() if len(row) > 8 and row[8].strip() else "open bar"
+        modele = "provision" if "provision" in raw_modele else "open bar"
         rates[client] = {
             "cc":          row[0].strip() if row[0] else "",
             "consult_soc": _f(row[2] if len(row) > 2 else 0),
@@ -206,6 +250,8 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
             "pharma_emp":  _f(row[5] if len(row) > 5 else 0),
             "optique_soc": _f_optique(row[6] if len(row) > 6 else ""),
             "optique_emp": _f_optique(row[7] if len(row) > 7 else ""),
+            "modele":      modele,                                      # "open bar" | "provision"
+            "plafond":     _f_plafond(row[9] if len(row) > 9 else ""), # FCFA ou None
         }
 
     # Prestataires
@@ -297,19 +343,21 @@ def process_data(lines, employees, params) -> list:
             part_emp = balance * rate["pharma_emp"]
 
         rows.append({
-            "employee_name": emp_name,
-            "client":        client or "(non identifié)",
-            "cc":            rate.get("cc", ""),
-            "dept":          emp_info["dept"],
-            "prestataire":   partner_name,
-            "prest_type":    prest_type,
-            "product":       product_name,
-            "date":          ln["date"],
-            "invoice_ref":   inv_ref,
-            "montant_total": balance,
-            "part_soc":      round(part_soc, 0),
-            "part_emp":      round(part_emp, 0),
-            "warning":       warning,
+            "employee_name":  emp_name,
+            "client":         client or "(non identifié)",
+            "cc":             rate.get("cc", ""),
+            "dept":           emp_info["dept"],
+            "prestataire":    partner_name,
+            "prest_type":     prest_type,
+            "product":        product_name,
+            "date":           ln["date"],
+            "invoice_ref":    inv_ref,
+            "montant_total":  balance,
+            "part_soc":       round(part_soc, 0),
+            "part_emp":       round(part_emp, 0),
+            "warning":        warning,
+            "modele":         rate.get("modele", "open bar"),
+            "plafond_client": rate.get("plafond"),
         })
 
     return rows
@@ -346,7 +394,8 @@ def _style_data(ws, row_num, cols, alt=False):
         c.font   = font
 
 
-def build_global_excel(rows: list, period_label: str) -> bytes:
+def build_global_excel(rows: list, period_label: str,
+                        rows_ytd: list = None, year: int = None) -> bytes:
     wb = openpyxl.Workbook()
 
     # ── Feuille Export (données brutes) ──────────────────────────────────
@@ -446,9 +495,103 @@ def build_global_excel(rows: list, period_label: str) -> bytes:
         ws3.column_dimensions[get_column_letter(col)].width = w
     ws3.freeze_panes = "A2"
 
+    # ── Feuille YTD Clients (si données disponibles) ──────────────────────
+    if rows_ytd:
+        ws4 = wb.create_sheet("YTD Clients")
+        yr_label = str(year) if year else ""
+        hdrs4 = ["Client", "CC", "Modèle", "Plafond Annuel",
+                 "Consul. YTD", "Pharma. YTD", "Optique YTD",
+                 "Total YTD", "Part Soc. YTD", "Part Emp. YTD",
+                 "% Plafond consommé"]
+        ws4.append(hdrs4)
+        _style_header(ws4, 1, len(hdrs4))
+
+        from collections import defaultdict as _dd
+        ytd_by_client = _dd(lambda: {"cc": "", "modele": "", "plafond": None,
+                                      "cons": 0, "phar": 0, "opti": 0,
+                                      "soc": 0, "emp": 0})
+        for r in rows_ytd:
+            c = ytd_by_client[r["client"]]
+            c["cc"]     = r.get("cc", "")
+            c["modele"] = r.get("modele", "open bar")
+            c["plafond"]= r.get("plafond_client")
+            if r["prest_type"] == "Consultation":
+                c["cons"] += r["montant_total"]
+            elif r["prest_type"] == "Optique":
+                c["opti"] += r["montant_total"]
+            else:
+                c["phar"] += r["montant_total"]
+            c["soc"] += r["part_soc"]
+            c["emp"] += r["part_emp"]
+
+        for i, (client, v) in enumerate(sorted(ytd_by_client.items())):
+            total = v["cons"] + v["phar"] + v["opti"]
+            plafond = v["plafond"]
+            pct_plafond = (total / plafond * 100) if plafond else None
+            ws4.append([
+                client, v["cc"],
+                "Provision" if v["modele"] == "provision" else "Open bar",
+                plafond if plafond else "—",
+                v["cons"], v["phar"], v["opti"],
+                total, v["soc"], v["emp"],
+                f"{pct_plafond:.1f} %" if pct_plafond is not None else "—",
+            ])
+            row_n = i + 2
+            _style_data(ws4, row_n, len(hdrs4), alt=(i % 2 == 1))
+            for col in [4, 5, 6, 7, 8, 9, 10]:
+                cell = ws4.cell(row=row_n, column=col)
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '#,##0" FCFA"'
+            # Colorier en orange si dépassement plafond
+            if pct_plafond is not None and pct_plafond >= 100:
+                for col in range(1, len(hdrs4) + 1):
+                    ws4.cell(row=row_n, column=col).fill = PatternFill("solid", fgColor="FFE0CC")
+            elif pct_plafond is not None and pct_plafond >= 80:
+                for col in range(1, len(hdrs4) + 1):
+                    ws4.cell(row=row_n, column=col).fill = PatternFill("solid", fgColor="FFF2CC")
+
+        for col, w in zip(range(1, len(hdrs4) + 1),
+                          [28, 10, 12, 18, 18, 16, 14, 16, 16, 16, 18]):
+            ws4.column_dimensions[get_column_letter(col)].width = w
+        ws4.freeze_panes = "A2"
+
+        # ── Feuille YTD Employés ───────────────────────────────────────────
+        ws5 = wb.create_sheet("YTD Employés")
+        hdrs5 = ["Employé(e)", "Client", "Consul. YTD", "Pharma. YTD",
+                 "Optique YTD", "Total YTD", "Part Soc. YTD", "Part Emp. YTD"]
+        ws5.append(hdrs5)
+        _style_header(ws5, 1, len(hdrs5))
+
+        ytd_by_emp = _dd(lambda: {"client": "", "cons": 0, "phar": 0,
+                                   "opti": 0, "soc": 0, "emp": 0})
+        for r in rows_ytd:
+            e = ytd_by_emp[r["employee_name"]]
+            e["client"] = r["client"]
+            if r["prest_type"] == "Consultation":
+                e["cons"] += r["montant_total"]
+            elif r["prest_type"] == "Optique":
+                e["opti"] += r["montant_total"]
+            else:
+                e["phar"] += r["montant_total"]
+            e["soc"] += r["part_soc"]
+            e["emp"] += r["part_emp"]
+
+        for i, (emp, v) in enumerate(sorted(ytd_by_emp.items())):
+            total = v["cons"] + v["phar"] + v["opti"]
+            ws5.append([emp, v["client"], v["cons"], v["phar"], v["opti"],
+                        total, v["soc"], v["emp"]])
+            _style_data(ws5, i + 2, len(hdrs5), alt=(i % 2 == 1))
+            for col in range(3, 9):
+                ws5.cell(row=i + 2, column=col).number_format = '#,##0" FCFA"'
+
+        for col, w in zip(range(1, len(hdrs5) + 1),
+                          [34, 28, 18, 16, 14, 16, 16, 16]):
+            ws5.column_dimensions[get_column_letter(col)].width = w
+        ws5.freeze_panes = "A2"
+
     # ── Titre et métadonnées ──────────────────────────────────────────────
-    for sheet in [ws, ws2, ws3]:
-        sheet.sheet_properties.tabColor = "1F4E79"
+    for sheet in wb.sheetnames:
+        wb[sheet].sheet_properties.tabColor = "1F4E79"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -675,6 +818,164 @@ def build_clients_recap_excel(rows: list, period_label: str) -> bytes:
                           [12, 26, 34, 32, 14, 18, 16, 18, 18]):
             ws.column_dimensions[get_column_letter(col)].width = w
         ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── RAPPORT PROVISION SANTÉ ──────────────────────────────────────────────
+def build_provision_excel(rows_ytd: list, params: dict,
+                           period_label: str, year: int) -> bytes:
+    """
+    Rapport de suivi des provisions santé par client :
+    - Plafond annuel configuré
+    - Consommé YTD (part société)
+    - Restant disponible
+    - Alertes dépassement / approche plafond
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Suivi Provision"
+
+    # ── Titre ──────────────────────────────────────────────────────────────
+    NCOLS = 10
+    ws.merge_cells(f"A1:{get_column_letter(NCOLS)}1")
+    ws["A1"] = f"Suivi Provision Santé — {year} — Cumulé au {period_label}"
+    ws["A1"].font      = Font(bold=True, size=13, color="FFFFFF", name="Calibri")
+    ws["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    ws.merge_cells(f"A2:{get_column_letter(NCOLS)}2")
+    ws["A2"] = "DI-Africa (Congo) SA · Direction Médicale · sante@di-africa.com"
+    ws["A2"].font      = Font(italic=True, size=9, color="595959", name="Calibri")
+    ws["A2"].alignment = Alignment(horizontal="center")
+    ws.row_dimensions[2].height = 16
+
+    # ── En-têtes ───────────────────────────────────────────────────────────
+    headers = [
+        "Client", "CC", "Modèle",
+        "Plafond Annuel", "Conso. Totale YTD", "Part Soc. YTD", "Part Emp. YTD",
+        "Restant Disponible", "% Consommé", "Statut",
+    ]
+    ws.append(headers)
+    _style_header(ws, 3, NCOLS)
+
+    # ── Agrégation YTD par client ──────────────────────────────────────────
+    by_client = defaultdict(lambda: {"cc": "", "modele": "open bar", "plafond": None,
+                                      "total": 0, "soc": 0, "emp": 0})
+    rates = params.get("rates", {})
+    for r in rows_ytd:
+        c = by_client[r["client"]]
+        c["total"] += r["montant_total"]
+        c["soc"]   += r["part_soc"]
+        c["emp"]   += r["part_emp"]
+        # Récupérer modèle et plafond depuis params
+        rate_info = rates.get(r["client"])
+        if rate_info is None:
+            for k in rates:
+                if k.lower() == r["client"].lower():
+                    rate_info = rates[k]
+                    break
+        if rate_info:
+            c["cc"]      = rate_info.get("cc", "")
+            c["modele"]  = rate_info.get("modele", "open bar")
+            c["plafond"] = rate_info.get("plafond")
+
+    # ── Lignes ─────────────────────────────────────────────────────────────
+    ORANGE = "FFE0CC"  # dépassement
+    YELLOW = "FFF2CC"  # approche (≥80%)
+    GREEN  = "E2EFDA"  # ok
+
+    for i, (client, v) in enumerate(sorted(by_client.items())):
+        plafond = v["plafond"]
+        modele  = v["modele"]
+
+        if plafond and modele == "provision":
+            restant    = max(0, plafond - v["soc"])
+            pct        = v["soc"] / plafond * 100
+            pct_txt    = f"{pct:.1f} %"
+            restant_txt = restant
+            if pct >= 100:
+                statut = "🔴 Dépassé"
+                bg = ORANGE
+            elif pct >= 80:
+                statut = "🟡 Attention"
+                bg = YELLOW
+            else:
+                statut = "🟢 OK"
+                bg = GREEN
+        else:
+            restant_txt = "—"
+            pct_txt     = "—"
+            statut      = "Open bar"
+            bg          = "FFFFFF"
+
+        ws.append([
+            client,
+            v["cc"],
+            "Provision" if modele == "provision" else "Open bar",
+            plafond if plafond else "—",
+            v["total"],
+            v["soc"],
+            v["emp"],
+            restant_txt,
+            pct_txt,
+            statut,
+        ])
+        row_n = i + 4
+        _style_data(ws, row_n, NCOLS)
+        if bg != "FFFFFF":
+            for col in range(1, NCOLS + 1):
+                ws.cell(row=row_n, column=col).fill = PatternFill("solid", fgColor=bg)
+        for col in [4, 5, 6, 7]:
+            cell = ws.cell(row=row_n, column=col)
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = '#,##0" FCFA"'
+        if isinstance(restant_txt, (int, float)):
+            ws.cell(row=row_n, column=8).number_format = '#,##0" FCFA"'
+
+    # Ligne totaux
+    last = 4 + len(by_client)
+    total_conso  = sum(v["total"] for v in by_client.values())
+    total_soc    = sum(v["soc"]   for v in by_client.values())
+    total_emp    = sum(v["emp"]   for v in by_client.values())
+    total_plafond = sum(v["plafond"] for v in by_client.values()
+                        if v["plafond"] and v["modele"] == "provision") or None
+    ws.append(["", "", "TOTAL",
+                total_plafond if total_plafond else "—",
+                total_conso, total_soc, total_emp,
+                "—", "—", ""])
+    _style_header(ws, last, NCOLS, bg="2E75B6")
+    for col in [5, 6, 7]:
+        ws.cell(row=last, column=col).number_format = '#,##0" FCFA"'
+    if isinstance(total_plafond, (int, float)):
+        ws.cell(row=last, column=4).number_format = '#,##0" FCFA"'
+
+    # ── Largeurs ───────────────────────────────────────────────────────────
+    for col, w in zip(range(1, NCOLS + 1),
+                      [30, 10, 12, 20, 20, 18, 18, 20, 14, 14]):
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.freeze_panes = "A4"
+
+    # ── Légende ────────────────────────────────────────────────────────────
+    ws_leg = wb.create_sheet("Légende")
+    ws_leg["A1"] = "Légende — Statuts Provision Santé"
+    ws_leg["A1"].font = Font(bold=True, size=11, name="Calibri")
+    legends = [
+        ("🔴 Dépassé",   "Consommation ≥ 100% du plafond",  ORANGE),
+        ("🟡 Attention", "Consommation entre 80% et 99% du plafond", YELLOW),
+        ("🟢 OK",        "Consommation < 80% du plafond",    GREEN),
+        ("Open bar",    "Pas de plafond configuré — refacturation intégrale", "FFFFFF"),
+    ]
+    for j, (statut, desc, color) in enumerate(legends, start=2):
+        ws_leg[f"A{j}"] = statut
+        ws_leg[f"B{j}"] = desc
+        ws_leg[f"A{j}"].fill = PatternFill("solid", fgColor=color)
+        ws_leg[f"B{j}"].fill = PatternFill("solid", fgColor=color)
+    ws_leg.column_dimensions["A"].width = 18
+    ws_leg.column_dimensions["B"].width = 55
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -971,6 +1272,16 @@ def main():
 
     st.divider()
 
+    # ── Option YTD ────────────────────────────────────────────────────────
+    include_ytd = st.checkbox(
+        "📅 Inclure les données cumulées YTD (Jan → mois sélectionné)",
+        value=True,
+        help="Ajoute les onglets 'YTD Clients' et 'YTD Employés' dans le rapport global "
+             "et génère le rapport de suivi provision santé."
+    )
+
+    st.divider()
+
     # ── Bouton de génération ──────────────────────────────────────────────
     if st.button("🚀 Générer les rapports", type="primary", use_container_width=True):
 
@@ -993,6 +1304,20 @@ def main():
         with st.spinner("Calcul des parts société / employé(e)…"):
             rows = process_data(lines, employees, params)
 
+        # Données YTD
+        rows_ytd = None
+        if include_ytd and month > 1:  # Si mois = janvier, YTD = mensuel
+            with st.spinner("Récupération des données YTD (Jan → mois sélectionné)…"):
+                lines_ytd = fetch_invoice_lines_ytd(uid, models, year, month)
+            with st.spinner("Calcul YTD…"):
+                rows_ytd = process_data(lines_ytd, employees, params)
+            ytd_label = f"Jan → {period_label}"
+            st.info(f"📅 YTD : {len(lines_ytd)} lignes sur {ytd_label}")
+        elif include_ytd and month == 1:
+            # Janvier : YTD = données du mois
+            rows_ytd = rows
+            ytd_label = period_label
+
         # Avertissements
         warnings = [r for r in rows if r["warning"]]
         if warnings:
@@ -1000,15 +1325,65 @@ def main():
                 for w in set(r["warning"] for r in warnings):
                     st.warning(w)
 
+        # ── Alertes Provision Santé ────────────────────────────────────────
+        if rows_ytd and params.get("rates"):
+            provision_clients = {
+                k: v for k, v in params["rates"].items()
+                if v.get("modele") == "provision" and v.get("plafond")
+            }
+            if provision_clients:
+                # Calcul YTD part soc par client
+                ytd_soc_by_client = defaultdict(float)
+                for r in rows_ytd:
+                    ytd_soc_by_client[r["client"]] += r["part_soc"]
+
+                alerts = []
+                for client, rate_info in provision_clients.items():
+                    plafond = rate_info["plafond"]
+                    # Matching insensible à la casse
+                    ytd_soc = 0
+                    for k, v in ytd_soc_by_client.items():
+                        if k.lower() == client.lower():
+                            ytd_soc = v
+                            break
+                    pct = ytd_soc / plafond * 100 if plafond > 0 else 0
+                    if pct >= 80:
+                        alerts.append((client, plafond, ytd_soc, pct))
+
+                if alerts:
+                    with st.expander(f"🏥 {len(alerts)} alerte(s) Provision Santé", expanded=True):
+                        for client, plafond, ytd_soc, pct in sorted(alerts, key=lambda x: -x[3]):
+                            restant = max(0, plafond - ytd_soc)
+                            if pct >= 100:
+                                st.error(
+                                    f"🔴 **{client}** — Plafond **DÉPASSÉ** : "
+                                    f"{ytd_soc:,.0f} / {plafond:,.0f} FCFA ({pct:.1f} %)"
+                                )
+                            else:
+                                st.warning(
+                                    f"🟡 **{client}** — {pct:.1f} % consommé · "
+                                    f"Restant : {restant:,.0f} FCFA "
+                                    f"({ytd_soc:,.0f} / {plafond:,.0f} FCFA)"
+                                )
+
         # ── Génération fichiers ───────────────────────────────────────────
         with st.spinner("Génération des fichiers…"):
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
 
-                # Export global
-                global_xls = build_global_excel(rows, period_label)
+                # Export global (avec onglets YTD si disponibles)
+                global_xls = build_global_excel(rows, period_label,
+                                                 rows_ytd=rows_ytd, year=year)
                 zf.writestr(f"Export_Global_{period_label.replace(' ', '_')}.xlsx",
                             global_xls)
+
+                # ── Rapport Provision Santé ───────────────────────────────
+                if rows_ytd:
+                    prov_xls = build_provision_excel(rows_ytd, params, period_label, year)
+                    zf.writestr(
+                        f"Provision_Sante_YTD_{year}.xlsx",
+                        prov_xls
+                    )
 
                 # ── Rapports clients (refacturation) ──────────────────────
                 # 1. Récapitulatif multi-onglets (synthèse + un onglet/client)
@@ -1068,16 +1443,32 @@ def main():
 
         zip_buf.seek(0)
 
-        # ── Résumé ────────────────────────────────────────────────────────
+        # ── Résumé mensuel ────────────────────────────────────────────────
         total_global = sum(r["montant_total"] for r in rows)
         total_soc    = sum(r["part_soc"]      for r in rows)
         total_emp    = sum(r["part_emp"]      for r in rows)
 
+        st.subheader(f"📊 {period_label} — Résumé mensuel")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Employés concernés",  len(by_emp))
         c2.metric("Total consommations", f"{total_global:,.0f} FCFA")
         c3.metric("Part Société",        f"{total_soc:,.0f} FCFA")
         c4.metric("Part Employé(e)",     f"{total_emp:,.0f} FCFA")
+
+        # ── Résumé YTD ────────────────────────────────────────────────────
+        if rows_ytd and month > 1:
+            ytd_global = sum(r["montant_total"] for r in rows_ytd)
+            ytd_soc    = sum(r["part_soc"]      for r in rows_ytd)
+            ytd_emp    = sum(r["part_emp"]      for r in rows_ytd)
+
+            st.subheader(f"📅 {ytd_label} — Cumul YTD")
+            d1, d2, d3, d4 = st.columns(4)
+            ytd_emps = len({r["employee_name"] for r in rows_ytd})
+            d1.metric("Employés (YTD)",    ytd_emps)
+            d2.metric("Total YTD",         f"{ytd_global:,.0f} FCFA",
+                      delta=f"+{ytd_global - total_global:,.0f} vs mois")
+            d3.metric("Part Soc. YTD",     f"{ytd_soc:,.0f} FCFA")
+            d4.metric("Part Emp. YTD",     f"{ytd_emp:,.0f} FCFA")
 
         st.success(f"✅ {len(by_emp)} fichiers individuels générés")
 
