@@ -1903,9 +1903,12 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
         if not rows_for_retenues:
             st.error("Aucune donnée de conso disponible. Générez d'abord les rapports du mois.")
         else:
+            year_r  = st.session_state.get("year",  year)
+            month_r = st.session_state.get("month", month)
             with st.spinner("Calcul et réconciliation…"):
                 ret_rows = compute_retenues(rows_for_retenues, attachments_odoo,
-                                            st.session_state.get("params", {}))
+                                            st.session_state.get("params", {}),
+                                            year=year_r, month=month_r)
                 st.session_state["retenue_rows"] = ret_rows
 
             n_maj    = sum(1 for r in ret_rows if r["statut_attachment"] == "maj")
@@ -1950,22 +1953,43 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
 
             # ── Téléchargement ────────────────────────────────────────────
             period_label_r = st.session_state.get("period_label", period_label)
-            year_r         = st.session_state.get("year", year)
-            month_r        = st.session_state.get("month", month)
+            # year_r / month_r déjà définis plus haut
             ret_xls = build_retenues_excel(ret_rows, period_label_r, year_r, month_r)
-            st.download_button(
-                label=f"📥 Télécharger Retenues_{period_label_r.replace(' ', '_')}.xlsx",
-                data=ret_xls,
-                file_name=f"Retenues_{period_label_r.replace(' ', '_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True,
-            )
+
+            # Avertissement anti-doublon AVANT le bouton de téléchargement
+            if n_new > 0:
+                st.warning(
+                    f"⚠️ **{n_new} nouvelle(s) retenue(s) à créer** (onglet 'Import Odoo NEW').  \n"
+                    "Cet onglet est à importer **une seule fois** dans Odoo.  \n"
+                    "Après import, **rechargez la page et régénérez** le plan pour confirmer "
+                    f"que ces {n_new} employé(s) passent bien en '✏️ MAJ' au prochain calcul.  \n"
+                    "Si un employé est dans **plusieurs lots de paie** ce mois, la retenue "
+                    "sera déduite à chaque bulletin — pensez à ajuster le champ "
+                    "'Nombre d'échéances' dans Odoo si nécessaire."
+                )
+
+            col_dl1, col_dl2 = st.columns([3, 1])
+            with col_dl1:
+                st.download_button(
+                    label=f"📥 Télécharger Retenues_{period_label_r.replace(' ', '_')}.xlsx",
+                    data=ret_xls,
+                    file_name=f"Retenues_{period_label_r.replace(' ', '_')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True,
+                )
+            with col_dl2:
+                if st.button("🔄 Forcer rechargement Odoo", use_container_width=True,
+                             help="Vide le cache (5 min) et relit hr.salary.attachment depuis Odoo — "
+                                  "utile après un import pour confirmer la prise en compte."):
+                    fetch_salary_attachments.clear()
+                    st.rerun()
+
             st.caption(
-                "**Onglet 'Import Odoo MAJ'** → à importer dans Odoo pour mettre à jour "
-                "les `monthly_amount` et `total_amount` des retenues existantes.  \n"
-                "**Onglet 'Import Odoo NEW'** → lignes à créer manuellement ou via import "
-                "pour les employés sans retenue active."
+                "**Import Odoo MAJ** → met à jour `monthly_amount` et `total_amount` "
+                "des retenues existantes (idempotent via `.id`).  \n"
+                "**Import Odoo NEW** → crée de nouveaux `hr.salary.attachment` "
+                "(description = 'Retrait Santé MM/AAAA' pour détecter les doublons)."
             )
 
         # ── Note Studio Odoo ──────────────────────────────────────────────
@@ -2077,7 +2101,8 @@ def _calc_retenue(total_du: float, regle: str = "15%") -> float:
     return min(round(retenue, 0), total_du)
 
 
-def compute_retenues(rows_month: list, attachments_odoo: dict, params: dict) -> list:
+def compute_retenues(rows_month: list, attachments_odoo: dict, params: dict,
+                     year: int = None, month: int = None) -> list:
     """
     Réconcilie la consommation du mois (part_emp par employé) avec les
     hr.salary.attachment actifs dans Odoo.
@@ -2090,6 +2115,8 @@ def compute_retenues(rows_month: list, attachments_odoo: dict, params: dict) -> 
     Retourne une liste de dicts, triée par client puis nom.
     """
     rates = params.get("rates", {})
+    # Label période pour la description des nouveaux attachments
+    _period_tag = f"{month:02d}/{year}" if year and month else ""
 
     # Agréger part_emp par employé depuis les lignes du mois
     by_emp: dict[str, dict] = {}
@@ -2124,7 +2151,8 @@ def compute_retenues(rows_month: list, attachments_odoo: dict, params: dict) -> 
             dette_mn1       = 0.0
             old_monthly     = 0.0
             odoo_id         = None
-            description     = "Santé Déduction"
+            # La description inclut la période pour détecter les doublons visuellement
+            description     = f"Retrait Santé {_period_tag}".strip() if _period_tag else "Retrait Santé"
             date_start      = ""
             input_type      = "Retraits Santé"
             statut_attachment = "nouveau"   # à créer dans Odoo
@@ -2282,23 +2310,36 @@ def build_retenues_excel(retenue_rows: list, period_label: str,
     ws3["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
     ws3["A1"].alignment = Alignment(horizontal="center")
 
+    # Ligne d'avertissement anti-doublon
+    ws3.merge_cells("A2:F2")
+    ws3["A2"] = (
+        "⚠️  IMPORTER UNE SEULE FOIS par employé par période. "
+        "Après import, relancer l'app — ces employés doivent passer en onglet 'Import Odoo MAJ'. "
+        "Si ce n'est pas le cas, vérifier que le type de saisie 'Retraits Santé' existe dans Odoo."
+    )
+    ws3["A2"].font      = Font(bold=True, size=10, color="7B2C00", name="Calibri")
+    ws3["A2"].fill      = PatternFill("solid", fgColor="FFE0CC")
+    ws3["A2"].alignment = Alignment(horizontal="left", wrap_text=True)
+    ws3.row_dimensions[2].height = 32
+
     hdrs3 = ["description", "employee_ids", "monthly_amount",
              "total_amount", "date_start", "other_input_type_id"]
     ws3.append(hdrs3)
-    _style_header(ws3, 2, len(hdrs3))
+    _style_header(ws3, 3, len(hdrs3))
 
     new_rows = [r for r in retenue_rows if r["statut_attachment"] == "nouveau"]
-    today_str = _dt.date.today().replace(day=1).isoformat()
+    # date_start = 1er jour du mois traité (year/month passés via build_retenues_excel)
+    first_of_month = _dt.date(year, month, 1).isoformat() if year and month else _dt.date.today().replace(day=1).isoformat()
     for i, r in enumerate(new_rows):
         ws3.append([
             r["description"],
             r["employee_name"],
             int(r["new_retenue"]),
             int(r["new_total"]),
-            today_str,
+            first_of_month,
             "Retraits Santé",
         ])
-        dr3 = i + 3
+        dr3 = i + 4   # +4 car : titre(1) + avertissement(2) + en-têtes(3)
         for ci in range(1, len(hdrs3) + 1):
             cell = ws3.cell(row=dr3, column=ci)
             cell.fill      = fill_new
@@ -2312,7 +2353,7 @@ def build_retenues_excel(retenue_rows: list, period_label: str,
 
     for col, w in zip(range(1, len(hdrs3) + 1), [28, 38, 18, 18, 14, 20]):
         ws3.column_dimensions[get_column_letter(col)].width = w
-    ws3.freeze_panes = "A3"
+    ws3.freeze_panes = "A4"
 
     # Couleur onglets
     for sheet in wb.sheetnames:
