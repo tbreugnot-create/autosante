@@ -3250,12 +3250,12 @@ def compute_retenues(
         att        = attachments_odoo.get(emp_name)
 
         if att:
-            dette_mn1         = att["remaining"]
-            old_monthly       = att["monthly_amount"]
-            odoo_id           = att["odoo_id"]
-            description       = att["description"]
-            date_start        = att["date_start"]
-            input_type        = att["input_type"]
+            dette_mn1         = att.get("remaining",      0.0)
+            old_monthly       = att.get("monthly_amount", 0.0)
+            odoo_id           = att.get("odoo_id",        None)   # absent de fetch_payslip_deductions
+            description       = att.get("description",   f"Retrait Santé {_period_tag}".strip())
+            date_start        = att.get("date_start",    "")
+            input_type        = att.get("input_type",    "Retraits Santé")
             statut_attachment = "maj"
         else:
             dette_mn1         = 0.0
