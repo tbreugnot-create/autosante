@@ -1894,7 +1894,10 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
                         "Total dû (Odoo)":   "{:,.0f}",
                         "Déjà prélevé":      "{:,.0f}",
                         "Restant":           "{:,.0f}",
-                    }).background_gradient(subset=["Restant"], cmap="Oranges"),
+                    }).apply(lambda col: [
+                        f"background-color: {'#FF6B35' if v > 100000 else '#FFB085' if v > 40000 else '#FFE0CC' if v > 0 else '#E2EFDA'}"
+                        for v in col
+                    ], subset=["Restant"]),
                     use_container_width=True, hide_index=True
                 )
 
@@ -1947,7 +1950,10 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
                         "Nouveau total":     "{:,.0f}",
                         "Nouvelle retenue":  "{:,.0f}",
                         "Solde fin de mois": "{:,.0f}",
-                    }).background_gradient(subset=["Solde fin de mois"], cmap="RdYlGn_r"),
+                    }).apply(lambda col: [
+                        f"background-color: {'#FFDAD9' if v > 100000 else '#FFE0CC' if v > 40000 else '#FFF9C4' if v > 0 else '#E2EFDA'}"
+                        for v in col
+                    ], subset=["Solde fin de mois"]),
                     use_container_width=True, hide_index=True
                 )
 
