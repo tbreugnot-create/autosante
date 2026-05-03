@@ -2423,8 +2423,96 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
             if not _n_surcharge and not _n_sans and _taux_reel >= _taux_cible:
                 st.success("✅ Clôture cohérente — aucune anomalie détectée.")
 
+            # ── Récap par client (format Contrôle Interne) ────────────────
+            st.markdown("#### 📊 Récap par client")
+            st.caption(
+                "Agrégation par client — reproduit les blocs **1_Exports Comptable** et "
+                "**2_Fiches de Paies** du fichier de contrôle interne mensuel."
+            )
+
+            _df_grp = (
+                df_ctrl.groupby("Client", sort=True)
+                .agg(
+                    **{
+                        "Nb employés":          ("Employé",          "count"),
+                        "Part Employé M":       ("Conso M (FCFA)",   "sum"),
+                        "Part Soc M":           ("Part Soc (FCFA)",  "sum"),
+                        "Dette M-1 (cumul)":    ("Dette M-1 (FCFA)", "sum"),
+                        "Total dû (M-1 + EmpM)":("Total dû (FCFA)",  "sum"),
+                        "Retrait sur paie M":   ("Retrait M (Odoo)", "sum"),
+                        "Dette restante M+1":   ("Dette 01/M+1",     "sum"),
+                    }
+                )
+                .reset_index()
+            )
+            # Colonne calculée : total comptable = Part Emp + Part Soc
+            _df_grp.insert(
+                3, "Total Comptable M",
+                _df_grp["Part Employé M"] + _df_grp["Part Soc M"]
+            )
+            # Taux de couverture par client
+            _df_grp["Taux couverture"] = _df_grp.apply(
+                lambda _r: (
+                    f"{_r['Retrait sur paie M'] / _r['Part Employé M']:.1%}"
+                    if _r["Part Employé M"] > 0 else "—"
+                ),
+                axis=1,
+            )
+            # Sans retenue (nb)
+            _sans_by_client = (
+                df_ctrl[df_ctrl["Statut"] == "🆕 Sans retenue"]
+                .groupby("Client")["Employé"]
+                .count()
+                .rename("Sans retenue")
+            )
+            _df_grp = _df_grp.merge(_sans_by_client, on="Client", how="left")
+            _df_grp["Sans retenue"] = _df_grp["Sans retenue"].fillna(0).astype(int)
+
+            # Ligne TOTAL
+            _total_row = pd.DataFrame([{
+                "Client":               "TOTAL",
+                "Nb employés":          _df_grp["Nb employés"].sum(),
+                "Part Employé M":       _df_grp["Part Employé M"].sum(),
+                "Part Soc M":           _df_grp["Part Soc M"].sum(),
+                "Total Comptable M":    _df_grp["Total Comptable M"].sum(),
+                "Dette M-1 (cumul)":    _df_grp["Dette M-1 (cumul)"].sum(),
+                "Total dû (M-1 + EmpM)":_df_grp["Total dû (M-1 + EmpM)"].sum(),
+                "Retrait sur paie M":   _df_grp["Retrait sur paie M"].sum(),
+                "Dette restante M+1":   _df_grp["Dette restante M+1"].sum(),
+                "Taux couverture": (
+                    f"{_df_grp['Retrait sur paie M'].sum() / _df_grp['Part Employé M'].sum():.1%}"
+                    if _df_grp["Part Employé M"].sum() > 0 else "—"
+                ),
+                "Sans retenue":         _df_grp["Sans retenue"].sum(),
+            }])
+            _df_grp_display = pd.concat([_df_grp, _total_row], ignore_index=True)
+
+            _fmt_int = "{:,.0f}"
+            st.dataframe(
+                _df_grp_display.style
+                .format({
+                    "Part Employé M":        _fmt_int,
+                    "Part Soc M":            _fmt_int,
+                    "Total Comptable M":     _fmt_int,
+                    "Dette M-1 (cumul)":     _fmt_int,
+                    "Total dû (M-1 + EmpM)": _fmt_int,
+                    "Retrait sur paie M":    _fmt_int,
+                    "Dette restante M+1":    _fmt_int,
+                })
+                .apply(
+                    lambda col: [
+                        "font-weight: bold; background-color: #1F4E79; color: white"
+                        if i == len(_df_grp_display) - 1 else ""
+                        for i in range(len(_df_grp_display))
+                    ],
+                    axis=0,
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
             # ── Tableau individuel ─────────────────────────────────────────
-            st.markdown("#### Détail par employé")
+            st.markdown("#### 👤 Détail par employé")
             st.dataframe(
                 df_ctrl[[
                     "Statut", "Employé", "Client",
@@ -2502,6 +2590,114 @@ Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouve
 
             for _col, _w in zip("ABCDEFGH", [18, 30, 18, 14, 14, 14, 16, 14]):
                 _ws.column_dimensions[_col].width = _w
+
+            # ── Onglet Récap Clients (format Contrôle Interne) ────────────
+            _ws2 = _wb.create_sheet("Récap Clients")
+
+            def _xl_h1(_ws, txt, ncols=10):
+                _ws.append([txt])
+                _r = _ws.max_row
+                _ws.cell(_r, 1).font = Font(bold=True, size=12, color="FFFFFF")
+                _ws.cell(_r, 1).fill = PatternFill("solid", fgColor="1F4E79")
+                _ws.merge_cells(start_row=_r, start_column=1, end_row=_r, end_column=ncols)
+
+            def _xl_subhdr(_ws, cols, bg="375623"):
+                _ws.append(cols)
+                _r = _ws.max_row
+                for _c in range(1, len(cols) + 1):
+                    _ws.cell(_r, _c).font      = Font(bold=True, color="FFFFFF")
+                    _ws.cell(_r, _c).fill      = PatternFill("solid", fgColor=bg)
+                    _ws.cell(_r, _c).alignment = Alignment(horizontal="center")
+
+            _ws2["A1"] = f"Contrôle Interne Pôle Santé — {_ctrl_period}"
+            _ws2["A1"].font = Font(bold=True, size=14)
+            _ws2.merge_cells("A1:K1")
+            _ws2.append([])
+
+            # Bloc 1 — Exports comptables
+            _xl_h1(_ws2, "1_Exports Comptable", ncols=11)
+            _xl_subhdr(_ws2, ["Client", "Part Employé(s)", "Part Société (Employeur)",
+                               "Total Comptable", "Nb Employés"], bg="1F4E79")
+            _fill_data = PatternFill("solid", fgColor="EBF3FB")
+            _fill_tot  = PatternFill("solid", fgColor="BDD7EE")
+            for _, _gr in _df_grp.iterrows():
+                _ws2.append([
+                    _gr["Client"],
+                    _gr["Part Employé M"],
+                    _gr["Part Soc M"],
+                    _gr["Total Comptable M"],
+                    int(_gr["Nb employés"]),
+                ])
+                _dr2 = _ws2.max_row
+                for _dc in range(1, 6):
+                    _ws2.cell(_dr2, _dc).fill = _fill_data
+                for _dc in [2, 3, 4]:
+                    _ws2.cell(_dr2, _dc).number_format = "#,##0"
+            # Ligne total bloc 1
+            _ws2.append([
+                "TOTAL",
+                _df_grp["Part Employé M"].sum(),
+                _df_grp["Part Soc M"].sum(),
+                _df_grp["Total Comptable M"].sum(),
+                int(_df_grp["Nb employés"].sum()),
+            ])
+            _dr2 = _ws2.max_row
+            for _dc in range(1, 6):
+                _ws2.cell(_dr2, _dc).font = Font(bold=True)
+                _ws2.cell(_dr2, _dc).fill = _fill_tot
+            for _dc in [2, 3, 4]:
+                _ws2.cell(_dr2, _dc).number_format = "#,##0"
+            _ws2.append([])
+
+            # Bloc 2 — Fiches de paie
+            _xl_h1(_ws2, "2_Fiches de Paies", ncols=11)
+            _xl_subhdr(_ws2, ["Client", "Dettes Employés (M-1)",
+                               "Total Retrait en cours (M-1+EmpM)",
+                               "Total Retrait sur paie M",
+                               "Dette restante M+1",
+                               "Taux couverture",
+                               "Nb sans retenue"], bg="375623")
+            _fill_data2 = PatternFill("solid", fgColor="EBF5EE")
+            _fill_warn  = PatternFill("solid", fgColor="FFF2CC")
+            for _, _gr in _df_grp.iterrows():
+                _has_sans = int(_gr["Sans retenue"]) > 0
+                _ws2.append([
+                    _gr["Client"],
+                    _gr["Dette M-1 (cumul)"],
+                    _gr["Total dû (M-1 + EmpM)"],
+                    _gr["Retrait sur paie M"],
+                    _gr["Dette restante M+1"],
+                    _gr["Taux couverture"],
+                    int(_gr["Sans retenue"]),
+                ])
+                _dr2 = _ws2.max_row
+                _fill2 = _fill_warn if _has_sans else _fill_data2
+                for _dc in range(1, 8):
+                    _ws2.cell(_dr2, _dc).fill = _fill2
+                for _dc in [2, 3, 4, 5]:
+                    _ws2.cell(_dr2, _dc).number_format = "#,##0"
+            # Ligne total bloc 2
+            _ws2.append([
+                "TOTAL",
+                _df_grp["Dette M-1 (cumul)"].sum(),
+                _df_grp["Total dû (M-1 + EmpM)"].sum(),
+                _df_grp["Retrait sur paie M"].sum(),
+                _df_grp["Dette restante M+1"].sum(),
+                (f"{_df_grp['Retrait sur paie M'].sum() / _df_grp['Part Employé M'].sum():.1%}"
+                 if _df_grp["Part Employé M"].sum() > 0 else "—"),
+                int(_df_grp["Sans retenue"].sum()),
+            ])
+            _dr2 = _ws2.max_row
+            for _dc in range(1, 8):
+                _ws2.cell(_dr2, _dc).font = Font(bold=True)
+                _ws2.cell(_dr2, _dc).fill = _fill_tot
+            for _dc in [2, 3, 4, 5]:
+                _ws2.cell(_dr2, _dc).number_format = "#,##0"
+
+            # Largeurs colonnes Récap
+            for _c, _w in zip("ABCDEFGHIJK", [20, 18, 24, 20, 18, 14, 16, 0, 0, 0, 0]):
+                if _w:
+                    _ws2.column_dimensions[_c].width = _w
 
             _buf = _io.BytesIO()
             _wb.save(_buf)
