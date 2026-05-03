@@ -233,7 +233,11 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
     # Taux Clients
     # Colonnes attendues dans "Taux Clients" :
     #  0=CC  1=Client  2=Consult_Soc  3=Consult_Emp  4=Pharma_Soc  5=Pharma_Emp
-    #  6=Optique_Soc  7=Optique_Emp  8=Modèle  9=Plafond_FCFA
+    #  6=Optique_Soc  7=Optique_Emp  8=Modèle  9=Plafond_Contrat  10=Plafond_Employé
+    #
+    # Optique_Soc peut être :
+    #   - Un FCFA (ex: 110000) → plafond annuel par employé (cumulatif YTD)
+    #   - Un % (ex: "80%")     → taux par facture, reliquat à charge employé
     rates = {}
     taux_rows = fetch_sheet_csv("Taux Clients")
     for row in taux_rows[1:]:   # skip header
@@ -243,15 +247,16 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
         raw_modele = row[8].strip().lower() if len(row) > 8 and row[8].strip() else "open bar"
         modele = "provision" if "provision" in raw_modele else "open bar"
         rates[client] = {
-            "cc":          row[0].strip() if row[0] else "",
-            "consult_soc": _f(row[2] if len(row) > 2 else 0),
-            "consult_emp": _f(row[3] if len(row) > 3 else 0),
-            "pharma_soc":  _f(row[4] if len(row) > 4 else 0),
-            "pharma_emp":  _f(row[5] if len(row) > 5 else 0),
-            "optique_soc": _f_optique(row[6] if len(row) > 6 else ""),
-            "optique_emp": _f_optique(row[7] if len(row) > 7 else ""),
-            "modele":      modele,                                      # "open bar" | "provision"
-            "plafond":     _f_plafond(row[9] if len(row) > 9 else ""), # FCFA ou None
+            "cc":           row[0].strip() if row[0] else "",
+            "consult_soc":  _f(row[2] if len(row) > 2 else 0),
+            "consult_emp":  _f(row[3] if len(row) > 3 else 0),
+            "pharma_soc":   _f(row[4] if len(row) > 4 else 0),
+            "pharma_emp":   _f(row[5] if len(row) > 5 else 0),
+            "optique_soc":  _f_optique(row[6] if len(row) > 6 else ""),
+            "optique_emp":  _f_optique(row[7] if len(row) > 7 else ""),
+            "modele":       modele,                                       # "open bar" | "provision"
+            "plafond":      _f_plafond(row[9]  if len(row) > 9  else ""),# Plafond contrat FCFA
+            "plafond_emp":  _f_plafond(row[10] if len(row) > 10 else ""),# Plafond par employé FCFA/an
         }
 
     # Prestataires
@@ -265,13 +270,78 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
 
 
 # ── TRAITEMENT PRINCIPAL ──────────────────────────────────────────────────
-def process_data(lines, employees, params) -> list:
+
+def _find_rate(client: str, rates: dict) -> dict | None:
+    """Recherche du taux client — exact puis partiel, insensible à la casse."""
+    for k in rates:
+        if k.lower() == client.lower():
+            return rates[k]
+    for k in rates:
+        if client.lower() in k.lower() or k.lower() in client.lower():
+            return rates[k]
+    return None
+
+
+def compute_ytd_optique_consumed(lines_prior: list, employees: dict,
+                                  params: dict) -> dict:
     """
-    Retourne une liste de dicts enrichis :
-      employee_name, client, dept, prestataire, prest_type,
-      product, date, invoice_ref,
-      montant_total, part_soc, part_emp,
-      warning (str ou None)
+    Calcule, pour chaque employé, la part déjà payée par la société
+    en optique sur les mois précédents (Jan → M-1).
+
+    Utilisé pour appliquer correctement le plafond optique annuel par employé :
+    si un employé a déjà consommé 80 000 FCFA sur son cap annuel de 110 000,
+    il ne reste que 30 000 FCFA de prise en charge société pour le mois courant.
+
+    Retourne : {employee_name: montant_soc_optique_ytd_precedents}
+    """
+    prests = params.get("prestataires", {})
+    rates  = params.get("rates", {})
+    consumed: dict[str, float] = defaultdict(float)
+
+    for ln in lines_prior:
+        emp_name     = ln["x_studio_employee_inv"][1]
+        emp_id       = ln["x_studio_employee_inv"][0]
+        partner_name = ln["partner_id"][1] if ln["partner_id"] else ""
+        product_name = ln["product_id"][1] if ln["product_id"] else ""
+        balance      = abs(float(ln["balance"] or 0))
+
+        # Détermination type prestataire
+        prest_type = prests.get(partner_name.upper())
+        if prest_type is None:
+            prest_type = "Optique" if "optique" in product_name.lower() else "Pharmacie"
+
+        if prest_type != "Optique":
+            continue  # On ne s'intéresse qu'à l'optique
+
+        emp_info = employees.get(emp_id, {"client": ""})
+        client   = emp_info.get("client", "")
+        rate     = _find_rate(client, rates)
+        if rate is None:
+            continue
+
+        opt_soc = rate.get("optique_soc")
+        if opt_soc is None:
+            continue
+
+        # Calcul de la part société payée sur les mois précédents
+        if opt_soc["type"] == "cap":
+            # On accumule ce que la société a réellement payé (plafond ou moins)
+            # Pour les mois antérieurs on utilise le cap plein (pas de recalcul imbriqué)
+            consumed[emp_name] += min(balance, opt_soc["val"])
+        # Si type "rate" → le cap ne s'applique pas annuellement, pas d'accumulation
+
+    return dict(consumed)
+
+
+def process_data(lines, employees, params,
+                 ytd_optique_consumed: dict = None,
+                 ytd_emp_total: dict = None) -> list:
+    """
+    Retourne une liste de dicts enrichis.
+
+    ytd_optique_consumed : {emp_name: fcfa_soc_payé_en_optique_mois_précédents}
+      → applique le plafond optique annuel par employé de façon cumulée
+    ytd_emp_total : {emp_name: fcfa_part_emp_ytd_précédents} (réservé future use)
     """
     rates  = params["rates"]
     prests = params["prestataires"]
@@ -291,33 +361,20 @@ def process_data(lines, employees, params) -> list:
         # Type prestataire
         prest_type = prests.get(partner_name.upper(), None)
         if prest_type is None:
-            prod_lower = product_name.lower()
-            if "optique" in prod_lower:
-                prest_type = "Optique"
-            else:
-                prest_type = "Pharmacie"  # défaut
+            prest_type = "Optique" if "optique" in product_name.lower() else "Pharmacie"
 
-        # Taux client (matching insensible à la casse)
-        rate = None
-        for k in rates:
-            if k.lower() == client.lower():
-                rate = rates[k]
-                break
-        # Fallback : matching partiel
-        if rate is None:
-            for k in rates:
-                if client.lower() in k.lower() or k.lower() in client.lower():
-                    rate = rates[k]
-                    break
+        # Taux client via helper (exact puis partiel, insensible casse)
+        rate = _find_rate(client, rates)
 
         warning = None
         if rate is None:
             warning = f"Client '{client}' introuvable dans Paramètres → taux 50/50 appliqué"
             rate = {"consult_soc": 0.5, "consult_emp": 0.5,
                     "pharma_soc": 0.5,  "pharma_emp": 0.5,
-                    "optique_soc": None, "optique_emp": None, "cc": ""}
+                    "optique_soc": None, "optique_emp": None,
+                    "cc": "", "modele": "open bar", "plafond": None, "plafond_emp": None}
 
-        # Calcul parts
+        # ── Calcul parts ──────────────────────────────────────────────────
         if prest_type == "Optique":
             opt_soc = rate["optique_soc"]
             opt_emp = rate["optique_emp"]
@@ -326,11 +383,16 @@ def process_data(lines, employees, params) -> list:
                 part_soc = balance * 0.5
                 part_emp = balance * 0.5
             elif opt_soc.get("type") == "cap":
-                # Plafond FCFA : société paye jusqu'au plafond, employé paye le reste
-                part_soc = min(balance, opt_soc["val"])
-                part_emp = max(0.0, balance - opt_soc["val"])
+                # Plafond FCFA ANNUEL par employé :
+                # La société couvre jusqu'au cap, l'employé paye le reste.
+                # On soustrait ce qui a déjà été pris en charge YTD.
+                annual_cap = opt_soc["val"]
+                already    = (ytd_optique_consumed or {}).get(emp_name, 0.0)
+                remaining  = max(0.0, annual_cap - already)
+                part_soc   = min(balance, remaining)
+                part_emp   = max(0.0, balance - remaining)
             else:
-                # Taux % : répartition par ratio
+                # Taux % par facture : répartition par ratio (pas de cap annuel)
                 soc_rate = opt_soc["val"]
                 emp_rate = opt_emp["val"] if opt_emp else (1.0 - soc_rate)
                 part_soc = balance * soc_rate
@@ -358,6 +420,7 @@ def process_data(lines, employees, params) -> list:
             "warning":        warning,
             "modele":         rate.get("modele", "open bar"),
             "plafond_client": rate.get("plafond"),
+            "plafond_emp":    rate.get("plafond_emp"),   # cap individuel annuel FCFA
         })
 
     return rows
@@ -1301,22 +1364,38 @@ def main():
                    f"{len(params['rates'])} clients · "
                    f"{len(params['prestataires'])} prestataires")
 
-        with st.spinner("Calcul des parts société / employé(e)…"):
-            rows = process_data(lines, employees, params)
+        # ── Données YTD + calcul optique cumulatif ───────────────────────────
+        rows_ytd   = None
+        ytd_label  = period_label
+        ytd_optique_consumed = None
 
-        # Données YTD
-        rows_ytd = None
-        if include_ytd and month > 1:  # Si mois = janvier, YTD = mensuel
+        if include_ytd:
             with st.spinner("Récupération des données YTD (Jan → mois sélectionné)…"):
                 lines_ytd = fetch_invoice_lines_ytd(uid, models, year, month)
-            with st.spinner("Calcul YTD…"):
-                rows_ytd = process_data(lines_ytd, employees, params)
-            ytd_label = f"Jan → {period_label}"
-            st.info(f"📅 YTD : {len(lines_ytd)} lignes sur {ytd_label}")
-        elif include_ytd and month == 1:
-            # Janvier : YTD = données du mois
-            rows_ytd = rows
-            ytd_label = period_label
+
+            if month > 1:
+                # Séparer les mois précédents (Jan→M-1) pour le calcul optique cumulatif
+                lines_prior = [l for l in lines_ytd if l["date"] < date_from]
+                with st.spinner("Calcul cumul optique YTD…"):
+                    ytd_optique_consumed = compute_ytd_optique_consumed(
+                        lines_prior, employees, params
+                    )
+                ytd_label = f"Jan → {period_label}"
+                st.info(f"📅 YTD : {len(lines_ytd)} lignes sur {ytd_label}")
+
+        with st.spinner("Calcul des parts société / employé(e)…"):
+            # Le calcul mensuel tient compte du cap optique déjà consommé YTD
+            rows = process_data(lines, employees, params,
+                                ytd_optique_consumed=ytd_optique_consumed)
+
+        if include_ytd:
+            with st.spinner("Calcul YTD complet…"):
+                if month > 1:
+                    rows_ytd = process_data(lines_ytd, employees, params,
+                                            ytd_optique_consumed=None)
+                    # Note: pour le YTD global, on recalcule sans correction (agrégat)
+                else:
+                    rows_ytd = rows  # Janvier : YTD = mois
 
         # Avertissements
         warnings = [r for r in rows if r["warning"]]
@@ -1324,6 +1403,44 @@ def main():
             with st.expander(f"⚠️ {len(warnings)} avertissement(s) de matching"):
                 for w in set(r["warning"] for r in warnings):
                     st.warning(w)
+
+        # ── Alertes Plafond Individuel ─────────────────────────────────────
+        if rows_ytd and params.get("rates"):
+            # Calcul YTD part_emp par employé
+            ytd_emp_conso = defaultdict(lambda: {"emp": 0.0, "plafond": None, "client": ""})
+            for r in rows_ytd:
+                e = ytd_emp_conso[r["employee_name"]]
+                e["emp"]     += r["part_emp"]
+                e["client"]   = r["client"]
+                if r.get("plafond_emp"):
+                    e["plafond"] = r["plafond_emp"]
+
+            emp_alerts = []
+            for emp_name_a, ev in ytd_emp_conso.items():
+                if ev["plafond"]:
+                    pct = ev["emp"] / ev["plafond"] * 100
+                    if pct >= 80:
+                        emp_alerts.append((emp_name_a, ev["client"],
+                                           ev["plafond"], ev["emp"], pct))
+
+            if emp_alerts:
+                with st.expander(
+                    f"👤 {len(emp_alerts)} employé(s) proche(s) de leur plafond individuel",
+                    expanded=len([a for a in emp_alerts if a[4] >= 100]) > 0
+                ):
+                    for emp_n, cli, plaf, consommé, pct in sorted(emp_alerts, key=lambda x: -x[4]):
+                        restant = max(0, plaf - consommé)
+                        if pct >= 100:
+                            st.error(
+                                f"🔴 **{emp_n}** ({cli}) — Plafond individuel **ATTEINT** : "
+                                f"{consommé:,.0f} / {plaf:,.0f} FCFA ({pct:.1f} %)"
+                            )
+                        else:
+                            st.warning(
+                                f"🟡 **{emp_n}** ({cli}) — {pct:.1f} % consommé · "
+                                f"Restant : {restant:,.0f} FCFA "
+                                f"({consommé:,.0f} / {plaf:,.0f} FCFA)"
+                            )
 
         # ── Alertes Provision Santé ────────────────────────────────────────
         if rows_ytd and params.get("rates"):
