@@ -136,9 +136,13 @@ def fetch_employees(_uid, _models):
     for r in rows:
         dept  = r["department_id"][1] if r["department_id"] else ""
         m     = _CLIENT_RE.search(dept)
-        client = m.group(1).strip() if m else ""
-        # Supprimer éventuel sous-site résiduel
-        client = re.sub(r'\s*/.*$', '', client).strip()
+        if m:
+            client = m.group(1).strip()
+            # Supprimer éventuel sous-site résiduel
+            client = re.sub(r'\s*/.*$', '', client).strip()
+        else:
+            # Pas de "Clients Congo" dans le département → employé corporate DI-Africa
+            client = "DI-Africa"
         result[r["id"]] = {
             "name":   r["name"],
             "dept":   dept,
@@ -313,7 +317,7 @@ def compute_ytd_optique_consumed(lines_prior: list, employees: dict,
         if prest_type != "Optique":
             continue  # On ne s'intéresse qu'à l'optique
 
-        emp_info = employees.get(emp_id, {"client": ""})
+        emp_info = employees.get(emp_id, {"client": "DI-Africa"})
         client   = emp_info.get("client", "")
         rate     = _find_rate(client, rates)
         if rate is None:
@@ -350,8 +354,17 @@ def process_data(lines, employees, params,
     for ln in lines:
         emp_id   = ln["x_studio_employee_inv"][0]
         emp_name = ln["x_studio_employee_inv"][1]
-        emp_info = employees.get(emp_id, {"name": emp_name, "dept": "", "client": ""})
-        client   = emp_info["client"]
+        emp_found = emp_id in employees
+        emp_info  = employees.get(emp_id, {"name": emp_name, "dept": "", "client": "DI-Africa", "active": True})
+        client    = emp_info["client"]
+
+        # Alerte statut employé
+        if not emp_found:
+            emp_warning = f"Employé inconnu dans Odoo : {emp_name} (ID {emp_id}) — facture {ln['move_id'][1] if ln['move_id'] else '?'}"
+        elif emp_info.get("active", True) is False:
+            emp_warning = f"Employé archivé : {emp_name} — vérifier dette / retenue encore active"
+        else:
+            emp_warning = None
 
         partner_name = ln["partner_id"][1] if ln["partner_id"] else ""
         product_name = ln["product_id"][1] if ln["product_id"] else ""
@@ -406,7 +419,7 @@ def process_data(lines, employees, params,
 
         rows.append({
             "employee_name":  emp_name,
-            "client":         client or "(non identifié)",
+            "client":         client or "DI-Africa",
             "cc":             rate.get("cc", ""),
             "dept":           emp_info["dept"],
             "prestataire":    partner_name,
@@ -417,8 +430,9 @@ def process_data(lines, employees, params,
             "montant_total":  balance,
             "part_soc":       round(part_soc, 0),
             "part_emp":       round(part_emp, 0),
-            "warning":        warning,
-            "modele":         rate.get("modele", "open bar"),
+            "warning":          warning,
+            "employee_warning": emp_warning,
+            "modele":           rate.get("modele", "open bar"),
             "plafond_client": rate.get("plafond"),
             "plafond_emp":    rate.get("plafond_emp"),   # cap individuel annuel FCFA
         })
@@ -1397,12 +1411,35 @@ def main():
                 else:
                     rows_ytd = rows  # Janvier : YTD = mois
 
-        # Avertissements
+        # Avertissements client / taux
         warnings = [r for r in rows if r["warning"]]
         if warnings:
             with st.expander(f"⚠️ {len(warnings)} avertissement(s) de matching"):
                 for w in set(r["warning"] for r in warnings):
                     st.warning(w)
+
+        # ── Alertes Employés inconnus / archivés ──────────────────────────
+        emp_warnings = [r for r in rows if r.get("employee_warning")]
+        if emp_warnings:
+            # Dédoublonner par message + regrouper les montants
+            from collections import defaultdict as _dd
+            grouped = _dd(float)
+            for r in emp_warnings:
+                grouped[r["employee_warning"]] += r["montant_total"]
+            archived = {k: v for k, v in grouped.items() if k.startswith("Employé archivé")}
+            unknown  = {k: v for k, v in grouped.items() if k.startswith("Employé inconnu")}
+            label = []
+            if unknown:  label.append(f"{len(unknown)} inconnu(s)")
+            if archived: label.append(f"{len(archived)} archivé(s)")
+            with st.expander(f"🔴 Employés à vérifier : {' · '.join(label)}", expanded=True):
+                if unknown:
+                    st.error("**Employés non trouvés dans Odoo** — factures potentiellement mal rattachées :")
+                    for msg, total in sorted(unknown.items(), key=lambda x: -x[1]):
+                        st.markdown(f"- {msg} · **{total:,.0f} FCFA**")
+                if archived:
+                    st.warning("**Employés archivés avec des consommations** — vérifier si dettes/retenues encore actives :")
+                    for msg, total in sorted(archived.items(), key=lambda x: -x[1]):
+                        st.markdown(f"- {msg} · **{total:,.0f} FCFA**")
 
         # ── Alertes Plafond Individuel ─────────────────────────────────────
         if rows_ytd and params.get("rates"):
