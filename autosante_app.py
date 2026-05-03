@@ -54,6 +54,37 @@ _CLIENT_RE = re.compile(
     re.IGNORECASE
 )
 
+# ── CLASSIFICATION DES ARTICLES DE FACTURATION ───────────────────────────
+# Détermine la règle de partage employeur/employé selon le code article Odoo.
+#
+#  "salarie"         → table "Taux Clients"         (taux contractuels par client)
+#  "ayants_droits"   → table "Taux Ayants Droits"   (taux spécifiques AD par client)
+#  "ayants_droits_na"→ 100 % employé                (non autorisé)
+#  "accident"        → 100 % employeur              (accident du travail)
+#  "insurance"       → 100 % employeur              (assurance / insurance)
+#  "acpe_vm"         → 100 % employeur              (ACPE / VM)
+#
+# Priorité de matching : du plus spécifique au plus générique.
+
+def _classify_article(product_name: str) -> str:
+    """Retourne le type d'article médical à partir du nom de produit Odoo."""
+    p = (product_name or "").lower()
+    if "accident" in p:
+        return "accident"
+    if "insurance" in p or "assurance" in p:
+        return "insurance"
+    if "acpe" in p or "( vm)" in p or "(vm)" in p or "acpe vm" in p:
+        return "acpe_vm"
+    if "ayant" in p:
+        # "NA" = non autorisé → 100% employé
+        if " na" in p or "/na" in p or p.endswith("na"):
+            return "ayants_droits_na"
+        return "ayants_droits"
+    if "salarié" in p or "salarie" in p or "salari" in p:
+        return "salarie"
+    # Fallback : traitement standard salarié
+    return "salarie"
+
 # ── CONNEXION ODOO ────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Connexion à Odoo…")
 def odoo_connect():
@@ -332,6 +363,36 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
             "regle_retenue":  raw_regle,                                     # règle retenue sur salaire
         }
 
+    # Taux Ayants Droits
+    # Même structure que "Taux Clients" — colonnes identiques.
+    # Si la feuille n'existe pas encore, on retourne un dict vide (pas de blocage).
+    rates_ad = {}
+    try:
+        taux_ad_rows = fetch_sheet_csv("Taux Ayants Droits")
+        for row in taux_ad_rows[1:]:
+            if len(row) < 2 or not row[1].strip():
+                continue
+            client_ad = row[1].strip()
+            raw_modele_ad = row[8].strip().lower() if len(row) > 8 and row[8].strip() else "open bar"
+            modele_ad = "provision" if "provision" in raw_modele_ad else "open bar"
+            raw_regle_ad = row[11].strip().lower() if len(row) > 11 and row[11].strip() else "15%"
+            rates_ad[client_ad] = {
+                "cc":             row[0].strip() if row[0] else "",
+                "consult_soc":    _f(row[2] if len(row) > 2 else 0),
+                "consult_emp":    _f(row[3] if len(row) > 3 else 0),
+                "pharma_soc":     _f(row[4] if len(row) > 4 else 0),
+                "pharma_emp":     _f(row[5] if len(row) > 5 else 0),
+                "optique_soc":    _f_optique(row[6] if len(row) > 6 else ""),
+                "optique_emp":    _f_optique(row[7] if len(row) > 7 else ""),
+                "modele":         modele_ad,
+                "plafond":        _f_plafond(row[9]  if len(row) > 9  else ""),
+                "plafond_emp":    _f_plafond(row[10] if len(row) > 10 else ""),
+                "regle_retenue":  raw_regle_ad,
+            }
+    except Exception:
+        # Feuille absente ou erreur → pas de blocage, avertissement en UI
+        rates_ad = {}
+
     # Prestataires
     prest = {}
     prest_rows = fetch_sheet_csv("Prestataires")
@@ -339,7 +400,7 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
         if len(row) >= 2 and row[0].strip():
             prest[row[0].strip().upper()] = row[1].strip()
 
-    return {"rates": rates, "prestataires": prest}
+    return {"rates": rates, "rates_ad": rates_ad, "prestataires": prest}
 
 
 # ── TRAITEMENT PRINCIPAL ──────────────────────────────────────────────────
@@ -445,46 +506,76 @@ def process_data(lines, employees, params,
         if prest_type is None:
             prest_type = "Optique" if "optique" in product_name.lower() else "Pharmacie"
 
-        # Taux client via helper (exact puis partiel, insensible casse)
-        rate = _find_rate(client, rates)
+        # ── Classification article ────────────────────────────────────────
+        article_type = _classify_article(product_name)
+
+        # ── Calcul parts selon article_type ──────────────────────────────
+        _RATE_100_EMP = {"consult_soc": 0.0, "consult_emp": 1.0,
+                         "pharma_soc":  0.0, "pharma_emp":  1.0,
+                         "optique_soc": None, "optique_emp": None,
+                         "cc": "", "modele": "open bar", "plafond": None, "plafond_emp": None}
+        _RATE_100_SOC = {"consult_soc": 1.0, "consult_emp": 0.0,
+                         "pharma_soc":  1.0, "pharma_emp":  0.0,
+                         "optique_soc": None, "optique_emp": None,
+                         "cc": "", "modele": "open bar", "plafond": None, "plafond_emp": None}
 
         warning = None
-        if rate is None:
-            warning = f"Client '{client}' introuvable dans Paramètres → taux 50/50 appliqué"
-            rate = {"consult_soc": 0.5, "consult_emp": 0.5,
-                    "pharma_soc": 0.5,  "pharma_emp": 0.5,
-                    "optique_soc": None, "optique_emp": None,
-                    "cc": "", "modele": "open bar", "plafond": None, "plafond_emp": None}
-
-        # ── Calcul parts ──────────────────────────────────────────────────
-        if prest_type == "Optique":
-            opt_soc = rate["optique_soc"]
-            opt_emp = rate["optique_emp"]
-            if opt_soc is None:
-                # Pas de règle optique → 50/50 par défaut
-                part_soc = balance * 0.5
-                part_emp = balance * 0.5
-            elif opt_soc.get("type") == "cap":
-                # Plafond FCFA ANNUEL par employé :
-                # La société couvre jusqu'au cap, l'employé paye le reste.
-                # On soustrait ce qui a déjà été pris en charge YTD.
-                annual_cap = opt_soc["val"]
-                already    = (ytd_optique_consumed or {}).get(emp_name, 0.0)
-                remaining  = max(0.0, annual_cap - already)
-                part_soc   = min(balance, remaining)
-                part_emp   = max(0.0, balance - remaining)
+        if article_type in ("accident", "insurance", "acpe_vm"):
+            # 100 % employeur — pas de recherche dans les tables
+            part_soc = balance
+            part_emp = 0.0
+            rate     = _RATE_100_SOC   # pour les champs cc/modele
+        elif article_type == "ayants_droits_na":
+            # 100 % employé (non autorisé)
+            part_soc = 0.0
+            part_emp = balance
+            rate     = _RATE_100_EMP
+        else:
+            # "salarie" → table Taux Clients
+            # "ayants_droits" → table Taux Ayants Droits (fallback → Taux Clients)
+            rates_ad = params.get("rates_ad", {})
+            if article_type == "ayants_droits" and rates_ad:
+                rate = _find_rate(client, rates_ad)
+                if rate is None:
+                    # Pas de ligne AD pour ce client → fallback table principale avec warning
+                    rate = _find_rate(client, rates)
+                    if rate is not None:
+                        warning = (f"Client '{client}' absent de 'Taux Ayants Droits' "
+                                   f"→ taux Salarié appliqué par défaut")
             else:
-                # Taux % par facture : répartition par ratio (pas de cap annuel)
-                soc_rate = opt_soc["val"]
-                emp_rate = opt_emp["val"] if opt_emp else (1.0 - soc_rate)
-                part_soc = balance * soc_rate
-                part_emp = balance * emp_rate
-        elif prest_type == "Consultation":
-            part_soc = balance * rate["consult_soc"]
-            part_emp = balance * rate["consult_emp"]
-        else:  # Pharmacie
-            part_soc = balance * rate["pharma_soc"]
-            part_emp = balance * rate["pharma_emp"]
+                rate = _find_rate(client, rates)
+
+            if rate is None:
+                warning = f"Client '{client}' introuvable dans Paramètres → taux 50/50 appliqué"
+                rate = {"consult_soc": 0.5, "consult_emp": 0.5,
+                        "pharma_soc": 0.5,  "pharma_emp": 0.5,
+                        "optique_soc": None, "optique_emp": None,
+                        "cc": "", "modele": "open bar", "plafond": None, "plafond_emp": None}
+
+            # Calcul selon type prestataire
+            if prest_type == "Optique":
+                opt_soc = rate["optique_soc"]
+                opt_emp = rate["optique_emp"]
+                if opt_soc is None:
+                    part_soc = balance * 0.5
+                    part_emp = balance * 0.5
+                elif opt_soc.get("type") == "cap":
+                    annual_cap = opt_soc["val"]
+                    already    = (ytd_optique_consumed or {}).get(emp_name, 0.0)
+                    remaining  = max(0.0, annual_cap - already)
+                    part_soc   = min(balance, remaining)
+                    part_emp   = max(0.0, balance - remaining)
+                else:
+                    soc_rate = opt_soc["val"]
+                    emp_rate = opt_emp["val"] if opt_emp else (1.0 - soc_rate)
+                    part_soc = balance * soc_rate
+                    part_emp = balance * emp_rate
+            elif prest_type == "Consultation":
+                part_soc = balance * rate["consult_soc"]
+                part_emp = balance * rate["consult_emp"]
+            else:  # Pharmacie
+                part_soc = balance * rate["pharma_soc"]
+                part_emp = balance * rate["pharma_emp"]
 
         rows.append({
             "employee_name":  emp_name,
@@ -494,6 +585,7 @@ def process_data(lines, employees, params,
             "prestataire":    partner_name,
             "prest_type":     prest_type,
             "product":        product_name,
+            "article_type":   article_type,   # "salarie"|"ayants_droits"|"ayants_droits_na"|"accident"|"insurance"|"acpe_vm"
             "date":           ln["date"],
             "invoice_ref":    inv_ref,
             "montant_total":  balance,
