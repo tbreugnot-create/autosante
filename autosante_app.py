@@ -124,6 +124,72 @@ def fetch_invoice_lines_ytd(_uid, _models, year: int, month: int):
     return odoo_read(_models, _uid, "account.move.line", domain, fields)
 
 
+@st.cache_data(ttl=300, show_spinner="Récupération des retenues Odoo (hr.salary.attachment)…")
+def fetch_salary_attachments(_uid, _models):
+    """
+    Lit tous les hr.salary.attachment de type 'Retraits Santé' actifs
+    pour la société DI-Africa Congo.
+
+    Retourne : {
+      emp_name: {
+        "odoo_id":        int,
+        "description":    str,
+        "employee_id":    int,
+        "employee_name":  str,
+        "monthly_amount": float,   # retenue mensuelle actuellement en place
+        "total_amount":   float,   # dette totale à recouvrer (s'incrémente)
+        "paid_amount":    float,   # déjà prélevé via paie
+        "remaining":      float,   # = total_amount - paid_amount
+        "date_start":     str,
+        "state":          str,     # "open" | "running" | "done"
+        "input_type":     str,
+      }
+    }
+    """
+    domain = [
+        ["company_id", "=",    COMPANY_ID],
+        ["state",      "in",   ["open", "running"]],
+    ]
+    fields = [
+        "id", "description", "employee_id",
+        "monthly_amount", "total_amount", "paid_amount",
+        "date_start", "state", "other_input_type_id",
+    ]
+    try:
+        records = odoo_read(_models, _uid, "hr.salary.attachment",
+                            domain, fields, limit=5000)
+    except Exception as e:
+        st.warning(f"⚠️ Impossible de lire hr.salary.attachment : {e}")
+        return {}
+
+    result = {}
+    for r in records:
+        input_type = r.get("other_input_type_id")
+        type_name  = input_type[1] if input_type else ""
+        # Garder uniquement les Retraits Santé
+        if not ("sant" in type_name.lower() or "retrait" in type_name.lower()):
+            continue
+        emp      = r.get("employee_id")
+        emp_id   = emp[0] if emp else None
+        emp_name = emp[1] if emp else ""
+        total    = float(r.get("total_amount", 0) or 0)
+        paid     = float(r.get("paid_amount",  0) or 0)
+        result[emp_name] = {
+            "odoo_id":        r["id"],
+            "description":    r.get("description", "Santé Déduction"),
+            "employee_id":    emp_id,
+            "employee_name":  emp_name,
+            "monthly_amount": float(r.get("monthly_amount", 0) or 0),
+            "total_amount":   total,
+            "paid_amount":    paid,
+            "remaining":      max(0.0, total - paid),
+            "date_start":     r.get("date_start", ""),
+            "state":          r.get("state", ""),
+            "input_type":     type_name,
+        }
+    return result
+
+
 @st.cache_data(ttl=3600, show_spinner="Chargement des employés (actifs + archivés)…")
 def fetch_employees(_uid, _models):
     """Employés DI-Africa Congo — actifs ET archivés pour garantir
@@ -238,6 +304,7 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
     # Colonnes attendues dans "Taux Clients" :
     #  0=CC  1=Client  2=Consult_Soc  3=Consult_Emp  4=Pharma_Soc  5=Pharma_Emp
     #  6=Optique_Soc  7=Optique_Emp  8=Modèle  9=Plafond_Contrat  10=Plafond_Employé
+    #  11=Règle_Retenue  (optionnel : "15%"|"total"|"1/3"|"1/4"|"1/5"|"fixe:25000")
     #
     # Optique_Soc peut être :
     #   - Un FCFA (ex: 110000) → plafond annuel par employé (cumulatif YTD)
@@ -250,17 +317,19 @@ def load_params_from_gsheet(sheet_id: str) -> dict:
         client = row[1].strip()
         raw_modele = row[8].strip().lower() if len(row) > 8 and row[8].strip() else "open bar"
         modele = "provision" if "provision" in raw_modele else "open bar"
+        raw_regle = row[11].strip().lower() if len(row) > 11 and row[11].strip() else "15%"
         rates[client] = {
-            "cc":           row[0].strip() if row[0] else "",
-            "consult_soc":  _f(row[2] if len(row) > 2 else 0),
-            "consult_emp":  _f(row[3] if len(row) > 3 else 0),
-            "pharma_soc":   _f(row[4] if len(row) > 4 else 0),
-            "pharma_emp":   _f(row[5] if len(row) > 5 else 0),
-            "optique_soc":  _f_optique(row[6] if len(row) > 6 else ""),
-            "optique_emp":  _f_optique(row[7] if len(row) > 7 else ""),
-            "modele":       modele,                                       # "open bar" | "provision"
-            "plafond":      _f_plafond(row[9]  if len(row) > 9  else ""),# Plafond contrat FCFA
-            "plafond_emp":  _f_plafond(row[10] if len(row) > 10 else ""),# Plafond par employé FCFA/an
+            "cc":             row[0].strip() if row[0] else "",
+            "consult_soc":    _f(row[2] if len(row) > 2 else 0),
+            "consult_emp":    _f(row[3] if len(row) > 3 else 0),
+            "pharma_soc":     _f(row[4] if len(row) > 4 else 0),
+            "pharma_emp":     _f(row[5] if len(row) > 5 else 0),
+            "optique_soc":    _f_optique(row[6] if len(row) > 6 else ""),
+            "optique_emp":    _f_optique(row[7] if len(row) > 7 else ""),
+            "modele":         modele,                                        # "open bar" | "provision"
+            "plafond":        _f_plafond(row[9]  if len(row) > 9  else ""), # Plafond contrat FCFA
+            "plafond_emp":    _f_plafond(row[10] if len(row) > 10 else ""), # Plafond par employé FCFA/an
+            "regle_retenue":  raw_regle,                                     # règle retenue sur salaire
         }
 
     # Prestataires
@@ -1496,6 +1565,12 @@ def main():
             # Le calcul mensuel tient compte du cap optique déjà consommé YTD
             rows = process_data(lines, employees, params,
                                 ytd_optique_consumed=ytd_optique_consumed)
+            # Mémoriser pour Phase 2 (retenues)
+            st.session_state["rows"]         = rows
+            st.session_state["params"]       = params
+            st.session_state["period_label"] = period_label
+            st.session_state["year"]         = year
+            st.session_state["month"]        = month
 
         if include_ytd:
             with st.spinner("Calcul YTD complet…"):
@@ -1734,41 +1809,518 @@ def main():
     st.divider()
 
     # ── Phase 2 : Retenues sur salaire ────────────────────────────────────
-    with st.expander("🔒 Phase 2 — Retenues sur salaire (à venir)", expanded=False):
-        st.info(
-            "**Cette fonctionnalité sera disponible dans une prochaine version.**\n\n"
-            "Elle permettra de :\n"
-            "- Générer automatiquement le plan de retenue mensuel sur salaire "
-            "(Part Employé(e) → déduction paie)\n"
-            "- Gérer le **report cumulatif** : si le salaire ne couvre pas l'intégralité "
-            "du mois, le solde est reporté au mois suivant\n"
-            "- Produire un fichier `Retenues_MOIS.xlsx` avec l'historique par employé(e)\n"
-            "- Synchronisation optionnelle avec Odoo Payroll\n\n"
-            "*Demande initiale : Aurice Bouamba — mars 2026*"
+    st.divider()
+    st.subheader("💰 Phase 2 — Retenues sur salaire")
+    st.caption(
+        "Calcule, pour chaque employé(e), la retenue mensuelle à opérer sur salaire "
+        "(Principe B : 15 % du total dû, min 10 000 FCFA si dette < 40 000 FCFA) "
+        "et met à jour les soldes cumulatifs."
+    )
+
+    with st.expander("ℹ️ Comment ça marche ?", expanded=False):
+        st.markdown(
+            """
+**Formule de calcul (Principe B — validé mars 2026) :**
+
+| Variable | Description |
+|---|---|
+| `dette M-1` | Solde reporté du mois précédent (feuille *Retenues* du Google Sheet) |
+| `conso M` | Part employé(e) calculée ci-dessus pour le mois sélectionné |
+| `total dû` | `dette M-1 + conso M` |
+| `retenue M` | 15 % × total dû — min 10 000 FCFA si total < 40 000 FCFA |
+| `solde fin de mois` | `total dû − retenue M` |
+
+**Règle par client** : une colonne *Règle_Retenue* (col 11) dans "Taux Clients" permet de paramétrer une règle différente par client :
+`15%` · `total` · `1/3` · `1/4` · `1/5` · `fixe:25000`
+
+**Google Sheets → feuille "Retenues"** (même classeur que Taux Clients) :
+
+| Employé Nom | Client | Solde M-1 (FCFA) |
+|---|---|---|
+| DUPONT Marie | ERoCo | 55 250 |
+| … | … | … |
+
+Après génération, l'onglet **MAJ Soldes** du fichier Excel contient les nouveaux soldes à coller dans cette feuille.
+            """
         )
-        st.button("🔔 Me notifier quand disponible", disabled=True,
-                  help="Fonctionnalité non encore implémentée")
+
+    col_r1, col_r2 = st.columns([2, 1])
+    with col_r1:
+        st.info(
+            "Les retenues sont calculées à partir des données du mois **déjà généré** ci-dessus. "
+            "Sélectionnez le même mois et cliquez sur Générer les rapports d'abord."
+        )
+    with col_r2:
+        gen_retenues = st.button(
+            "💰 Générer le plan de retenues",
+            type="primary",
+            use_container_width=True,
+            disabled="rows" not in st.session_state,
+            help="Nécessite d'avoir généré les rapports du mois d'abord."
+        )
+
+    if gen_retenues or "retenue_rows" in st.session_state:
+        # ── 1. Fetch salary attachments depuis Odoo ───────────────────────
+        with st.spinner("Lecture des retenues actives dans Odoo…"):
+            attachments_odoo = fetch_salary_attachments(uid, models)
+
+        n_att = len(attachments_odoo)
+        if n_att == 0:
+            st.warning(
+                "Aucun `hr.salary.attachment` de type 'Retraits Santé' trouvé dans Odoo "
+                f"pour la société #{COMPANY_ID}. Vérifiez le modèle ou le filtre."
+            )
+        else:
+            st.success(f"✅ {n_att} retenues actives chargées depuis Odoo")
+
+        # ── 2. Aperçu rapide des attachments Odoo ────────────────────────
+        with st.expander(f"📂 {n_att} retenues actives dans Odoo (avant calcul)", expanded=False):
+            import pandas as pd
+            if attachments_odoo:
+                df_att = pd.DataFrame([
+                    {
+                        "Employé":           a["employee_name"],
+                        "Retenue mensuelle": a["monthly_amount"],
+                        "Total dû (Odoo)":   a["total_amount"],
+                        "Déjà prélevé":      a["paid_amount"],
+                        "Restant":           a["remaining"],
+                        "Depuis":            a["date_start"],
+                    }
+                    for a in attachments_odoo.values()
+                ]).sort_values("Restant", ascending=False)
+                st.dataframe(
+                    df_att.style.format({
+                        "Retenue mensuelle": "{:,.0f}",
+                        "Total dû (Odoo)":   "{:,.0f}",
+                        "Déjà prélevé":      "{:,.0f}",
+                        "Restant":           "{:,.0f}",
+                    }).background_gradient(subset=["Restant"], cmap="Oranges"),
+                    use_container_width=True, hide_index=True
+                )
+
+        # ── 3. Calcul des retenues ────────────────────────────────────────
+        rows_for_retenues = st.session_state.get("rows", [])
+        if not rows_for_retenues:
+            st.error("Aucune donnée de conso disponible. Générez d'abord les rapports du mois.")
+        else:
+            with st.spinner("Calcul et réconciliation…"):
+                ret_rows = compute_retenues(rows_for_retenues, attachments_odoo,
+                                            st.session_state.get("params", {}))
+                st.session_state["retenue_rows"] = ret_rows
+
+            n_maj    = sum(1 for r in ret_rows if r["statut_attachment"] == "maj")
+            n_new    = sum(1 for r in ret_rows if r["statut_attachment"] == "nouveau")
+            n_soldé  = sum(1 for r in ret_rows if r["solde_fin_mois"] == 0)
+            t_retenu = sum(r["new_retenue"]    for r in ret_rows)
+            t_solde  = sum(r["solde_fin_mois"] for r in ret_rows)
+            t_conso  = sum(r["conso_mois"]     for r in ret_rows)
+
+            rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+            rc1.metric("✏️ Mises à jour",     n_maj)
+            rc2.metric("🆕 À créer dans Odoo", n_new)
+            rc3.metric("Total à retenir M",   f"{t_retenu:,.0f} FCFA")
+            rc4.metric("Dette portée M+1",    f"{t_solde:,.0f} FCFA")
+            rc5.metric("Conso M (part emp.)", f"{t_conso:,.0f} FCFA")
+
+            # ── Tableau analyse ───────────────────────────────────────────
+            with st.expander("📋 Détail complet", expanded=True):
+                df_ret = pd.DataFrame([{
+                    "Statut":            r["statut_attachment"],
+                    "Employé":           r["employee_name"],
+                    "Client":            r["client"],
+                    "Retenue actuelle":  r["old_monthly"],
+                    "Encours M-1":       r["dette_mn1"],
+                    "Nlle Conso M":      r["conso_mois"],
+                    "Nouveau total":     r["new_total"],
+                    "Règle":             r["regle"],
+                    "Nouvelle retenue":  r["new_retenue"],
+                    "Solde fin de mois": r["solde_fin_mois"],
+                } for r in ret_rows])
+                st.dataframe(
+                    df_ret.style.format({
+                        "Retenue actuelle":  "{:,.0f}",
+                        "Encours M-1":       "{:,.0f}",
+                        "Nlle Conso M":      "{:,.0f}",
+                        "Nouveau total":     "{:,.0f}",
+                        "Nouvelle retenue":  "{:,.0f}",
+                        "Solde fin de mois": "{:,.0f}",
+                    }).background_gradient(subset=["Solde fin de mois"], cmap="RdYlGn_r"),
+                    use_container_width=True, hide_index=True
+                )
+
+            # ── Téléchargement ────────────────────────────────────────────
+            period_label_r = st.session_state.get("period_label", period_label)
+            year_r         = st.session_state.get("year", year)
+            month_r        = st.session_state.get("month", month)
+            ret_xls = build_retenues_excel(ret_rows, period_label_r, year_r, month_r)
+            st.download_button(
+                label=f"📥 Télécharger Retenues_{period_label_r.replace(' ', '_')}.xlsx",
+                data=ret_xls,
+                file_name=f"Retenues_{period_label_r.replace(' ', '_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+            )
+            st.caption(
+                "**Onglet 'Import Odoo MAJ'** → à importer dans Odoo pour mettre à jour "
+                "les `monthly_amount` et `total_amount` des retenues existantes.  \n"
+                "**Onglet 'Import Odoo NEW'** → lignes à créer manuellement ou via import "
+                "pour les employés sans retenue active."
+            )
+
+        # ── Note Studio Odoo ──────────────────────────────────────────────
+        with st.expander("🔧 Champs Pôle Santé sur la fiche employé (Studio)", expanded=False):
+            st.markdown("""
+**Pour afficher l'encours et la dernière retenue directement sur la fiche employé Odoo :**
+
+1. Ouvrir **Studio** → modèle **Employé** (`hr.employee`) → onglet **Pôle Santé**
+2. Ajouter un champ **Calculé** (type Monétaire) nommé `x_studio_encours_sante` :
+   ```python
+   # Logique (champ compute Python dans Studio)
+   for rec in self:
+       atts = self.env['hr.salary.attachment'].search([
+           ('employee_id', '=', rec.id),
+           ('state', 'in', ['open', 'running']),
+           ('other_input_type_id.name', 'ilike', 'Santé'),
+       ])
+       rec.x_studio_encours_sante = sum(
+           (a.total_amount - a.paid_amount) for a in atts
+       )
+   ```
+   Label : **Encours total dettes santé** — Mode : **Lecture seule**
+
+3. Ajouter un champ **Calculé** (type Monétaire) nommé `x_studio_derniere_retenue` :
+   ```python
+   for rec in self:
+       att = self.env['hr.salary.attachment'].search([
+           ('employee_id', '=', rec.id),
+           ('state', 'in', ['open', 'running']),
+           ('other_input_type_id.name', 'ilike', 'Santé'),
+       ], order='date_start desc', limit=1)
+       rec.x_studio_derniere_retenue = att.monthly_amount if att else 0
+   ```
+   Label : **Dernière retenue sur paie** — Mode : **Lecture seule**
+
+> 💡 Ces champs seront visibles par les RH dans la fiche de chaque employé pour aider à expliquer les déductions sur fiche de paie.
+            """)
 
 
-# ── PHASE 2 : RETENUES SUR SALAIRE (À VENIR) ─────────────────────────────
-def _phase2_placeholder():
+
+# ── PHASE 2 : RETENUES SUR SALAIRE ───────────────────────────────────────
+
+def fetch_retenues_sheet(sheet_id: str) -> dict:  # kept for compatibility — no longer used
     """
-    Section désactivée — intégration future des retenues sur salaire.
+    Lit la feuille 'Retenues' du Google Sheet partagé.
+    Structure attendue :
+      Col 0 = Employé Nom  |  Col 1 = Client  |  Col 2 = Solde M-1 (FCFA)
 
-    Contexte (email Aurice, mars 2026) :
-      - Chaque mois, la Part Employé(e) calculée doit être déduite du salaire
-      - Le suivi doit être CUMULATIF : reporter le solde restant si le salaire
-        ne couvre pas l'intégralité de la retenue du mois
-      - Historique mensuel par employé(e) : mois, montant déduit, solde restant
-      - À synchroniser avec le logiciel de paie (Odoo Payroll ou export manuel)
-
-    Implémentation prévue :
-      1. Stocker un récapitulatif mensuel dans Google Sheets (feuille "Retenues")
-      2. À chaque génération, calculer le delta restant (mois précédent + nouveau)
-      3. Générer un fichier "Retenues_MOIS.xlsx" avec le plan de déduction par employé
-      4. Export optionnel vers Odoo Payroll via API (write sur hr.payslip.line)
+    Retourne : {nom_employé: solde_mn1_float}
     """
-    pass   # sera activé en Phase 2
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+        f"/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote('Retenues')}"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "AutoSante/2.2"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+        rows = list(csv.reader(raw.splitlines()))
+    except Exception as e:
+        st.warning(f"⚠️ Impossible de lire la feuille 'Retenues' : {e} — soldes M-1 à zéro.")
+        return {}
+
+    result = {}
+    for row in rows[1:]:  # skip header
+        if not row or not row[0].strip():
+            continue
+        nom = row[0].strip()
+        try:
+            solde = float(str(row[2]).replace(",", "").replace(" ", "").strip()) if len(row) > 2 and row[2].strip() else 0.0
+        except (ValueError, TypeError):
+            solde = 0.0
+        result[nom] = solde
+    return result
+
+
+def _calc_retenue(total_du: float, regle: str = "15%") -> float:
+    """
+    Applique la règle de retenue sur le total dû (dette M-1 + conso M).
+
+    Règles acceptées :
+      "15%"         → Principe B : 15% du total, min 10 000 FCFA si total < 40 000
+      "total"       → Retrait en une fois
+      "1/3"         → Un tiers
+      "1/4"         → Un quart
+      "1/5"         → Un cinquième
+      "fixe:25000"  → Montant fixe mensuel (ex: 25 000 FCFA)
+    """
+    if total_du <= 0:
+        return 0.0
+    r = regle.strip().lower()
+    if r == "total":
+        return round(total_du, 0)
+    elif r == "1/3":
+        return round(total_du / 3, 0)
+    elif r == "1/4":
+        return round(total_du / 4, 0)
+    elif r == "1/5":
+        return round(total_du / 5, 0)
+    elif r.startswith("fixe:"):
+        try:
+            return min(round(float(r.split(":")[1]), 0), total_du)
+        except (ValueError, IndexError):
+            pass
+    # Par défaut : Principe B — 15%, min 10 000 FCFA si dette < 40 000
+    retenue = total_du * 0.15
+    if total_du < 40_000:
+        retenue = max(retenue, 10_000.0)
+    return min(round(retenue, 0), total_du)
+
+
+def compute_retenues(rows_month: list, attachments_odoo: dict, params: dict) -> list:
+    """
+    Réconcilie la consommation du mois (part_emp par employé) avec les
+    hr.salary.attachment actifs dans Odoo.
+
+    Trois cas :
+      A) Attachment existant + conso M     → mise à jour monthly + total
+      B) Attachment existant + conso M = 0 → portée de dette, recalcul retenue
+      C) Conso M mais pas d'attachment     → nouvelle ligne à créer dans Odoo
+
+    Retourne une liste de dicts, triée par client puis nom.
+    """
+    rates = params.get("rates", {})
+
+    # Agréger part_emp par employé depuis les lignes du mois
+    by_emp: dict[str, dict] = {}
+    for r in rows_month:
+        name   = r["employee_name"]
+        client = r["client"]
+        if name not in by_emp:
+            by_emp[name] = {"client": client, "conso_mois": 0.0}
+        by_emp[name]["conso_mois"] += r["part_emp"]
+
+    # Ajouter les employés avec attachment mais aucune conso ce mois
+    for emp_name, att in attachments_odoo.items():
+        if emp_name not in by_emp:
+            by_emp[emp_name] = {"client": "", "conso_mois": 0.0}
+
+    result = []
+    for emp_name, info in by_emp.items():
+        client     = info["client"]
+        conso_mois = info["conso_mois"]
+        att        = attachments_odoo.get(emp_name)
+
+        # Dette M-1 = solde restant dans Odoo (total_amount - paid_amount)
+        if att:
+            dette_mn1       = att["remaining"]
+            old_monthly     = att["monthly_amount"]
+            odoo_id         = att["odoo_id"]
+            description     = att["description"]
+            date_start      = att["date_start"]
+            input_type      = att["input_type"]
+            statut_attachment = "maj"    # mise à jour
+        else:
+            dette_mn1       = 0.0
+            old_monthly     = 0.0
+            odoo_id         = None
+            description     = "Santé Déduction"
+            date_start      = ""
+            input_type      = "Retraits Santé"
+            statut_attachment = "nouveau"   # à créer dans Odoo
+
+        new_total = dette_mn1 + conso_mois   # nouveau total_amount à pousser dans Odoo
+
+        # Règle de retenue par client
+        rate  = _find_rate(client, rates) if client else None
+        regle = rate.get("regle_retenue", "15%") if rate else "15%"
+
+        new_retenue   = _calc_retenue(new_total, regle)
+        solde_fin     = max(0.0, new_total - new_retenue)
+
+        result.append({
+            # ── Identifiants Odoo ───────────────────────────────────────
+            "odoo_id":          odoo_id,
+            "description":      description,
+            "date_start":       date_start,
+            "input_type":       input_type,
+            "statut_attachment": statut_attachment,   # "maj" | "nouveau"
+            # ── Données employé ─────────────────────────────────────────
+            "employee_name":    emp_name,
+            "client":           client,
+            # ── Calcul retenue ───────────────────────────────────────────
+            "conso_mois":       round(conso_mois,   0),
+            "dette_mn1":        round(dette_mn1,    0),   # remaining Odoo
+            "new_total":        round(new_total,    0),   # → nouveau total_amount Odoo
+            "old_monthly":      round(old_monthly,  0),   # retenue avant
+            "regle":            regle,
+            "new_retenue":      round(new_retenue,  0),   # → nouveau monthly_amount Odoo
+            "solde_fin_mois":   round(solde_fin,    0),   # restant après retenue
+        })
+
+    return sorted(result, key=lambda x: (x["statut_attachment"], x["client"], x["employee_name"]))
+
+
+def build_retenues_excel(retenue_rows: list, period_label: str,
+                         year: int, month: int) -> bytes:
+    """
+    Génère Retenues_{MOIS}.xlsx avec 3 onglets :
+      1. "Analyse {mois}"    : tableau complet — style Import Mars
+      2. "Import Odoo MAJ"   : CSV prêt à importer dans Odoo (.id, monthly_amount, total_amount)
+      3. "Import Odoo NEW"   : lignes à créer (employés sans attachment existant)
+    """
+    import datetime as _dt
+    wb  = openpyxl.Workbook()
+
+    fill_new  = PatternFill("solid", fgColor="DAEEF3")   # bleu pâle = nouveau
+    fill_zero = PatternFill("solid", fgColor="E2EFDA")   # vert = soldé
+    fill_red  = PatternFill("solid", fgColor="FFDAD9")   # rouge = dette élevée
+
+    # ── Onglet 1 : Analyse ────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = f"Analyse {period_label}"
+
+    ws.merge_cells("A1:K1")
+    ws["A1"] = f"Plan de retenues sur salaire — {period_label}  (source : Odoo hr.salary.attachment)"
+    ws["A1"].font      = Font(bold=True, size=13, color="FFFFFF", name="Calibri")
+    ws["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ws.row_dimensions[1].height = 24
+
+    hdrs = ["Statut", "Employé(e)", "Client",
+            "Retenue actuelle\n(Odoo)", "Encours M-1\n(Odoo)",
+            "Nlle Conso M\n(part emp.)",
+            "Nouveau total\ndû", "Règle",
+            "Nouvelle retenue\nM", "Solde fin\nde mois",
+            "Δ Retenue"]
+    ws.append(hdrs)
+    _style_header(ws, 2, len(hdrs))
+    ws.row_dimensions[2].height = 36
+
+    t_old_m = t_dette = t_conso = t_new_total = t_new_ret = t_solde = 0.0
+
+    for i, r in enumerate(retenue_rows):
+        is_new = r["statut_attachment"] == "nouveau"
+        delta  = r["new_retenue"] - r["old_monthly"]
+        ws.append([
+            "🆕 À créer" if is_new else "✏️ MAJ",
+            r["employee_name"], r["client"],
+            r["old_monthly"] if not is_new else "",
+            r["dette_mn1"],  r["conso_mois"],
+            r["new_total"],  r["regle"],
+            r["new_retenue"], r["solde_fin_mois"],
+            delta if not is_new else "",
+        ])
+        dr = i + 3
+        rf = fill_new if is_new else (fill_zero if r["solde_fin_mois"] == 0 else fill_red)
+        for ci in range(1, len(hdrs) + 1):
+            cell = ws.cell(row=dr, column=ci)
+            if rf:
+                cell.fill = rf
+            cell.font      = Font(name="Calibri", size=10)
+            cell.alignment = Alignment(horizontal="left")
+        for ci in [4, 5, 6, 7, 9, 10, 11]:
+            ws.cell(row=dr, column=ci).number_format = '#,##0" FCFA"'
+
+        t_old_m   += r["old_monthly"]
+        t_dette   += r["dette_mn1"]
+        t_conso   += r["conso_mois"]
+        t_new_total += r["new_total"]
+        t_new_ret += r["new_retenue"]
+        t_solde   += r["solde_fin_mois"]
+
+    lr = 3 + len(retenue_rows)
+    ws.append(["", f"TOTAL ({len(retenue_rows)} employés)", "",
+               t_old_m, t_dette, t_conso, t_new_total, "",
+               t_new_ret, t_solde, t_new_ret - t_old_m])
+    _style_header(ws, lr, len(hdrs), bg="2E75B6")
+    for ci in [4, 5, 6, 7, 9, 10, 11]:
+        ws.cell(row=lr, column=ci).number_format = '#,##0" FCFA"'
+
+    for col, w in zip(range(1, len(hdrs) + 1),
+                      [12, 34, 22, 18, 16, 16, 16, 12, 18, 18, 14]):
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.freeze_panes = "B3"
+
+    # ── Onglet 2 : Import Odoo MAJ (lignes existantes à mettre à jour) ────
+    ws2 = wb.create_sheet("Import Odoo MAJ")
+    ws2.merge_cells("A1:E1")
+    ws2["A1"] = (f"Import Odoo — mise à jour retenues — {period_label}  "
+                 f"(coller dans Odoo > Salaires > Acomptes & Saisies)")
+    ws2["A1"].font      = Font(bold=True, size=11, color="FFFFFF", name="Calibri")
+    ws2["A1"].fill      = PatternFill("solid", fgColor="375623")
+    ws2["A1"].alignment = Alignment(horizontal="center")
+
+    # En-tête compatible import Odoo (utilise .id = database integer ID)
+    hdrs2 = [".id", "description", "employee_ids",
+             "monthly_amount", "total_amount"]
+    ws2.append(hdrs2)
+    _style_header(ws2, 2, len(hdrs2), bg="375623")
+
+    maj_rows = [r for r in retenue_rows if r["statut_attachment"] == "maj"]
+    for i, r in enumerate(maj_rows):
+        ws2.append([
+            r["odoo_id"],
+            r["description"],
+            r["employee_name"],
+            int(r["new_retenue"]),
+            int(r["new_total"]),
+        ])
+        _style_data(ws2, i + 3, len(hdrs2), alt=(i % 2 == 1))
+        for ci in [4, 5]:
+            ws2.cell(row=i + 3, column=ci).number_format = '#,##0'
+
+    for col, w in zip(range(1, len(hdrs2) + 1), [14, 28, 38, 18, 18]):
+        ws2.column_dimensions[get_column_letter(col)].width = w
+    ws2.freeze_panes = "A3"
+
+    # ── Onglet 3 : Import Odoo NEW (nouvelles lignes à créer) ─────────────
+    ws3 = wb.create_sheet("Import Odoo NEW")
+    ws3.merge_cells("A1:F1")
+    ws3["A1"] = f"Import Odoo — nouvelles retenues à créer — {period_label}"
+    ws3["A1"].font      = Font(bold=True, size=11, color="FFFFFF", name="Calibri")
+    ws3["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
+    ws3["A1"].alignment = Alignment(horizontal="center")
+
+    hdrs3 = ["description", "employee_ids", "monthly_amount",
+             "total_amount", "date_start", "other_input_type_id"]
+    ws3.append(hdrs3)
+    _style_header(ws3, 2, len(hdrs3))
+
+    new_rows = [r for r in retenue_rows if r["statut_attachment"] == "nouveau"]
+    today_str = _dt.date.today().replace(day=1).isoformat()
+    for i, r in enumerate(new_rows):
+        ws3.append([
+            r["description"],
+            r["employee_name"],
+            int(r["new_retenue"]),
+            int(r["new_total"]),
+            today_str,
+            "Retraits Santé",
+        ])
+        dr3 = i + 3
+        for ci in range(1, len(hdrs3) + 1):
+            cell = ws3.cell(row=dr3, column=ci)
+            cell.fill      = fill_new
+            cell.font      = Font(name="Calibri", size=10)
+            cell.alignment = Alignment(horizontal="left")
+        for ci in [3, 4]:
+            ws3.cell(row=dr3, column=ci).number_format = '#,##0'
+
+    if not new_rows:
+        ws3.append(["(aucune nouvelle retenue ce mois)"])
+
+    for col, w in zip(range(1, len(hdrs3) + 1), [28, 38, 18, 18, 14, 20]):
+        ws3.column_dimensions[get_column_letter(col)].width = w
+    ws3.freeze_panes = "A3"
+
+    # Couleur onglets
+    for sheet in wb.sheetnames:
+        wb[sheet].sheet_properties.tabColor = "1F4E79"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 if __name__ == "__main__":
