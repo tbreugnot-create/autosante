@@ -666,6 +666,101 @@ def build_global_excel(rows: list, period_label: str,
             ws5.column_dimensions[get_column_letter(col)].width = w
         ws5.freeze_panes = "A2"
 
+        # ── Feuille Top Consommateurs ──────────────────────────────────────
+        ws6 = wb.create_sheet("Top Consommateurs")
+        yr_label6 = str(year) if year else ""
+
+        # Titre
+        ws6.merge_cells("A1:J1")
+        ws6["A1"] = f"Top Consommateurs Santé — {yr_label6} (Jan → {period_label})"
+        ws6["A1"].font      = Font(bold=True, size=13, color="FFFFFF", name="Calibri")
+        ws6["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
+        ws6["A1"].alignment = Alignment(horizontal="center")
+        ws6.row_dimensions[1].height = 24
+
+        hdrs6 = ["#", "Employé(e)", "Client", "Statut",
+                 "Total YTD", "Part Soc. YTD", "Part Emp. YTD",
+                 "Consul. YTD", "Pharma. YTD", "Optique YTD"]
+        ws6.append(hdrs6)
+        _style_header(ws6, 2, len(hdrs6))
+
+        # Réutiliser ytd_by_emp (déjà construit pour ws5)
+        # + enrichir avec statut actif/archivé si disponible depuis rows_ytd
+        emp_warnings_map = {}
+        for r in rows_ytd:
+            w = r.get("employee_warning")
+            if w:
+                emp_warnings_map[r["employee_name"]] = w
+
+        ranked = sorted(ytd_by_emp.items(),
+                        key=lambda x: x[1]["cons"] + x[1]["phar"] + x[1]["opti"],
+                        reverse=True)
+
+        # Paliers couleur (fonds) : top 10% rouge, top 30% orange, reste normal
+        n_emp = len(ranked)
+        fill_red    = PatternFill("solid", fgColor="FFDAD9")
+        fill_orange = PatternFill("solid", fgColor="FFF2CC")
+        fill_arch   = PatternFill("solid", fgColor="E2EFDA")  # vert pâle = archivé/inconnu
+
+        for i, (emp, v) in enumerate(ranked):
+            total = v["cons"] + v["phar"] + v["opti"]
+            rank  = i + 1
+
+            # Statut employé
+            emp_w = emp_warnings_map.get(emp, "")
+            if "archivé" in emp_w:
+                statut = "⚠️ Archivé"
+            elif "inconnu" in emp_w:
+                statut = "❓ Inconnu"
+            else:
+                statut = "✅ Actif"
+
+            ws6.append([rank, emp, v["client"], statut,
+                        total, v["soc"], v["emp"],
+                        v["cons"], v["phar"], v["opti"]])
+
+            data_row = i + 3
+            # Couleur de fond selon rang / statut
+            if emp_w:
+                row_fill = fill_arch
+            elif n_emp >= 10 and rank <= max(1, n_emp // 10):
+                row_fill = fill_red
+            elif rank <= max(3, n_emp // 3):
+                row_fill = fill_orange
+            else:
+                row_fill = PatternFill("solid", fgColor="F9F9F9") if i % 2 == 1 else None
+
+            for col_idx in range(1, len(hdrs6) + 1):
+                cell = ws6.cell(row=data_row, column=col_idx)
+                if row_fill:
+                    cell.fill = row_fill
+                cell.font      = Font(name="Calibri", size=10)
+                cell.alignment = Alignment(horizontal="left")
+
+            for col_idx in range(5, 11):  # colonnes montants
+                ws6.cell(row=data_row, column=col_idx).number_format = '#,##0" FCFA"'
+            ws6.cell(row=data_row, column=1).alignment = Alignment(horizontal="center")
+
+        # Ligne totaux
+        last_row6 = 3 + len(ranked)
+        grand_total = sum(v["cons"] + v["phar"] + v["opti"] for _, v in ytd_by_emp.items())
+        grand_soc   = sum(v["soc"] for _, v in ytd_by_emp.items())
+        grand_emp   = sum(v["emp"] for _, v in ytd_by_emp.items())
+        grand_cons  = sum(v["cons"] for _, v in ytd_by_emp.items())
+        grand_phar  = sum(v["phar"] for _, v in ytd_by_emp.items())
+        grand_opti  = sum(v["opti"] for _, v in ytd_by_emp.items())
+        ws6.append(["", f"TOTAL ({len(ranked)} employés)", "", "",
+                    grand_total, grand_soc, grand_emp,
+                    grand_cons, grand_phar, grand_opti])
+        _style_header(ws6, last_row6, len(hdrs6), bg="2E75B6")
+        for col_idx in range(5, 11):
+            ws6.cell(row=last_row6, column=col_idx).number_format = '#,##0" FCFA"'
+
+        for col, w in zip(range(1, len(hdrs6) + 1),
+                          [5, 34, 22, 12, 18, 16, 16, 16, 14, 14]):
+            ws6.column_dimensions[get_column_letter(col)].width = w
+        ws6.freeze_panes = "B3"
+
     # ── Titre et métadonnées ──────────────────────────────────────────────
     for sheet in wb.sheetnames:
         wb[sheet].sheet_properties.tabColor = "1F4E79"
